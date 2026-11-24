@@ -95,7 +95,7 @@ macOS 菜单栏内存监控 + 一键清理：原生 Swift/AppKit、零第三方�
 | 10 分钟 RSS 波动 | 76.9 MB → 44.0 MB（系统在内存压力下回收干净页所致，**无增长趋势**） | 无泄漏（10 s × 60 次采样） |
 | `--diagnostics`（无界面）RSS | 6.4 MB | 只跑 syscall 时的净占用 |
 
-测量方式与原始数据见 [docs/USAGE.md#性能实测](docs/USAGE.md)。
+测量方式与原始数据见 [docs/USAGE.md#5-性能实测](docs/USAGE.md)。
 
 ## 内部诊断参数（不作为稳定接口）
 
