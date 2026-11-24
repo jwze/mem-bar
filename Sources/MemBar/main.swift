@@ -34,7 +34,10 @@ if arguments.contains("--selftest") {
     // while a dispatch block is still on the stack.
     let kickoff = Timer(timeInterval: 0.3, repeats: false) { timer in
         print("[selftest] timer fired")
-        MainActor.assumeIsolated { testController.runSelfTest() }
+        MainActor.assumeIsolated {
+            testController.start()
+            testController.runSelfTest()
+        }
     }
     RunLoop.main.add(kickoff, forMode: .common)
     testApplication.run()

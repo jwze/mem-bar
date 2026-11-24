@@ -18,6 +18,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.info(
             "launched pid=\(getpid()) version=\(AppInfo.version)"
                 + " bundle=\(Bundle.main.bundlePath) loginItem=\(LoginItem.statusDescription)"
+                + " statusItemVisible=\(controller.statusItemIsVisible)"
         )
     }
 

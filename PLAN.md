@@ -167,13 +167,17 @@ MemBar/
 | `./Scripts/build-app.sh && ./Scripts/install.sh` | 构建 + ad-hoc 签名 + `codesign --verify --strict` + 冒烟诊断通过；`/Applications/MemBar.app` 已启动，`pgrep -x MemBar` 单实例 |
 | `--diagnostics` 输出 | 打印自身 RSS/线程、已用/缓存/空闲/可回收/压缩/有线、交换、压力 |
 | 已用/交换与活动监视器误差 <10% | 交换与 `sysctl vm.swapusage` 同源（误差 0）；已用 11.5 GB vs 活动监视器口径 ≈12.6 GB（App Memory+有线+压缩），差 8.3% |
-| RSS ≤30 MB / CPU ≤0.2% / 10 分钟稳定 | footprint 18.1 MB（峰值 19.7）、RSS 78–82 MB（空白 AppKit 基线 78.8 MB）、CPU 0.0%（偶发 0.2%）、10 分钟采样无增长 |
+| RSS ≤30 MB / CPU ≤0.2% / 10 分钟稳定 | footprint 17.6 MB（峰值 19.8）、RSS 76.9 MB（空白 AppKit 基线 78.8 MB）、默认 5 秒刷新空闲 CPU 0.09%（60 次采样平均，峰值 1.6%；2 秒刷新 0.72%）、10 分钟 RSS 76.9→44.0 MB（系统回收干净页，无上升趋势） |
+| CPU 预算达成手段 | 固定宽度状态栏项、百分比/压力变化才重绘、明细行只在菜单打开时重建（`updateInfoItems` 从 tick 路径移出）；这三项把 5 秒刷新的空闲 CPU 从 0.37% 压到 0.09% |
 | 一键清理 ≤3 秒返回 + 前后对比 | `--clean` 实测 0.2–0.8 s，结果行与 `clean ...` 日志同时输出；`--selftest` 走 `cleanNow()` 同一路径通过 |
 | 气球效果不足时按规则降档 | 见上表「差异」与 README 实测表，默认已降为 64 MB，结果行会写「未获得可回收缓存」 |
 | 勾选进程 → 结束后消失；未勾选禁用；系统进程不列出 | `--selftest` 用真实 `sleep` 子进程验证「勾选可用 → 结束成功 → 回到禁用」；单元测试覆盖过滤与「3 秒未退出只报告、不 SIGKILL」 |
 | 登录项注册/取消 | 首次启动日志 `login item registered` / `登录项 registered=已启用`；菜单勾选状态来自 `SMAppService.mainApp.status` |
 | 双实例 | 直接运行第二个二进制：日志 `second instance detected (pid …); exiting`，`pgrep` 计数保持 1 |
 | 压力分级颜色切换 | `--selftest` 用合成「几乎无可回收」快照断言 🔴 紧张 + 红色文字 + 实心图标，随后恢复真实采样 |
+| 菜单栏图标确实在系统菜单栏 | 启动日志 `statusItemVisible=true`；`--selftest` 打印 `statusItem.isVisible=true` 与按钮帧 `(878, 923, 67, 33)`（屏幕高 956pt → 顶栏内） |
+| 登录项可关闭/可恢复 | `--selftest` 关闭→断言 `notRegistered(0)`→恢复→`enabled`；`sfltool dumpbtm` 中 MemBar 为 `[enabled, allowed, notified]`，URL `/Applications/MemBar.app` |
+| 刷新间隔/回收强度切换 | `--selftest` 切到 2 s / 128 MB 再切回，断言 `sampler.interval`、勾选态与 `UserDefaults` 同步 |
 
 ## 已知限制
 

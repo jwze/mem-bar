@@ -14,6 +14,11 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var lastCleanAt: Date?
     private var lastKill: (text: String, at: Date)?
 
+    /// Last rendered menu-bar state; the system only redraws the bar when these change, so a
+    /// 5 s tick that lands on the same percent/pressure must not touch the title again.
+    private var renderedPercent = -1
+    private var renderedPressure: MemoryPressure?
+
     private var isCleaning = false
     private var candidates: [ProcessSample] = []
     private var checkedPIDs: Set<pid_t> = []
@@ -37,11 +42,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let quitItem = NSMenuItem()
 
     override init() {
-        self.statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Fixed width: a variable-length item forces the window server to re-lay-out the whole
+        // menu bar on every percentage change, which dominates the app's CPU time.
+        self.statusItem = NSStatusBar.system.statusItem(withLength: 64)
         super.init()
         configureButton()
         configureMenu()
     }
+
+    /// Whether the item is actually in the menu bar (a third-party menu-bar manager can hide it).
+    var statusItemIsVisible: Bool { statusItem.isVisible }
 
     func start() {
         let sampler = Sampler(interval: Prefs.refreshInterval)
@@ -65,7 +75,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         guard let button = statusItem.button else { return }
         button.image = idleImage
         button.imagePosition = .imageLeading
-        button.attributedTitle = statusTitle(" –%", pressure: .normal)
+        button.title = " –%"
         button.toolTip = "MemBar 内存监控"
         statusItem.menu = menu
     }
@@ -86,18 +96,30 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private func apply(_ snapshot: MemorySnapshot) {
         self.snapshot = snapshot
         updateStatusButton(snapshot)
-        updateInfoItems(snapshot)
     }
 
     private func updateStatusButton(_ snapshot: MemorySnapshot) {
         guard let button = statusItem.button else { return }
         let pressure = snapshot.pressure
-        button.image = pressure.isCritical ? criticalImage : idleImage
-        button.attributedTitle = statusTitle(" \(Fmt.percent(snapshot.percent))", pressure: pressure)
-        button.toolTip = "内存 \(Fmt.percent(snapshot.percent))"
-            + " · 已用 \(Fmt.bytes(snapshot.used)) / \(Fmt.bytes(snapshot.total))"
-            + " · 交换 \(Fmt.bytes(snapshot.swapUsed))"
-            + " · \(pressure.dot) \(pressure.label)"
+        let percent = snapshot.percentRoundedUp
+        if percent != renderedPercent || pressure != renderedPressure {
+            renderedPercent = percent
+            renderedPressure = pressure
+            button.image = pressure.isCritical ? criticalImage : idleImage
+            if pressure.isCritical {
+                button.attributedTitle = statusTitle(" \(Fmt.percent(snapshot.percent))", pressure: pressure)
+            } else {
+                // A plain title is far cheaper to re-lay-out than an attributed one, and the menu
+                // bar already renders it with the system font.
+                button.title = " \(Fmt.percent(snapshot.percent))"
+            }
+            // Tooltip text costs a handful of ByteCountFormatter calls; only rebuild it together
+            // with the title, not on every sampling tick.
+            button.toolTip = "内存 \(Fmt.percent(snapshot.percent))"
+                + " · 已用 \(Fmt.bytes(snapshot.used)) / \(Fmt.bytes(snapshot.total))"
+                + " · 交换 \(Fmt.bytes(snapshot.swapUsed))"
+                + " · \(pressure.dot) \(pressure.label)"
+        }
     }
 
     // MARK: - Menu construction
@@ -337,6 +359,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 self.checkedPIDs.removeAll()
                 self.rebuildProcessMenu()
                 self.apply(MemoryStats.sample())
+                if let snapshot = self.snapshot { self.updateInfoItems(snapshot) }
             }
         }
     }
@@ -365,6 +388,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 Log.info("terminate selected ended=\(result.terminated) stuck=\(result.stuck)")
                 self.rebuildProcessMenu()
                 self.apply(MemoryStats.sample())
+                if let snapshot = self.snapshot { self.updateInfoItems(snapshot) }
             }
         }
     }
@@ -419,6 +443,8 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var selfTestBefore: MemorySnapshot?
     private var selfTestChild: pid_t = 0
     private var selfTestDeadline = Date()
+    private var selfTestOriginalInterval = Prefs.defaultRefreshSeconds
+    private var selfTestOriginalBalloon = Prefs.defaultBalloonMB
 }
 // MARK: - Self test (`MemBar --selftest`)
 
@@ -427,9 +453,13 @@ extension StatusItemController {
     /// A timer walks the stages because the production actions finish on the main queue.
     func runSelfTest() {
         var failures: [String] = []
+        selfTestOriginalInterval = Prefs.refreshSeconds
+        selfTestOriginalBalloon = Prefs.balloonMB
         apply(MemoryStats.sample())
         print("\(AppInfo.name) \(AppInfo.version) 自检")
         print("菜单栏文字: \(statusItem.button?.attributedTitle.string ?? "<空>")")
+        print("菜单栏项可见: \(statusItem.isVisible) · 按钮帧: \(statusItem.button?.window?.frame.debugDescription ?? "无")")
+        if !statusItem.isVisible { selfTestFail("状态栏项不可见") }
         if statusItem.button?.image == nil { failures.append("菜单栏图标缺失") }
 
         menuWillOpen(menu)
@@ -472,6 +502,36 @@ extension StatusItemController {
         if titleColor != .systemRed { selfTestFail("紧张状态未使用红色文字") }
         if statusItem.button?.image !== criticalImage { selfTestFail("紧张状态未使用实心图标") }
         apply(MemoryStats.sample())
+        let restoredColor = statusItem.button?.attributedTitle.attribute(
+            .foregroundColor,
+            at: 0,
+            effectiveRange: nil
+        ) as? NSColor
+        print("恢复正常: 文字=\(statusItem.button?.title ?? "") 颜色=\(restoredColor == .systemRed ? "红" : "默认")")
+        if restoredColor == .systemRed { selfTestFail("恢复正常后文字仍为红色") }
+
+        // Interval / balloon menu wiring.
+        if let twoSeconds = intervalMenu.items.first(where: { $0.tag == 2 }) {
+            selectInterval(twoSeconds)
+            if sampler?.interval != 2 { selfTestFail("刷新间隔未生效") }
+            if intervalMenu.items.first(where: { $0.tag == 2 })?.state != .on {
+                selfTestFail("刷新间隔勾选未更新")
+            }
+        }
+        if let defaultInterval = intervalMenu.items.first(where: { $0.tag == selfTestOriginalInterval }) {
+            selectInterval(defaultInterval)
+        }
+        if let bigBalloonItem = balloonMenu.items.first(where: { $0.tag == 128 }) {
+            selectBalloon(bigBalloonItem)
+            if Prefs.balloonMB != 128 { selfTestFail("回收强度未持久化") }
+        }
+        if let defaultBalloon = balloonMenu.items.first(where: { $0.tag == selfTestOriginalBalloon }) {
+            selectBalloon(defaultBalloon)
+        }
+        print("偏好切换: 刷新→2s 再回到 \(selfTestOriginalInterval)s · 气球→128MB 再回到 \(selfTestOriginalBalloon)MB")
+        if let quitMenu = menu.items.first(where: { $0 === quitItem }), quitMenu.keyEquivalent != "q" {
+            selfTestFail("退出缺少 ⌘Q")
+        }
 
         selfTestFailures = failures
         selfTestBefore = MemoryStats.sample()
@@ -555,12 +615,28 @@ extension StatusItemController {
         selfTestTimer = nil
         selfTestState = .idle
 
-        let interval = Prefs.refreshSeconds
-        let balloon = Prefs.balloonMB
-        Prefs.refreshSeconds = interval
-        Prefs.balloonMB = balloon
-        if Prefs.refreshSeconds != interval || Prefs.balloonMB != balloon { selfTestFail("偏好设置读写不一致") }
-        print("偏好: 刷新 \(interval)s · 气球 \(balloon)MB · 登录项 \(LoginItem.statusDescription)")
+        // Login item round trip (only meaningful for the installed copy, which is the one
+        // Background Task Management tracks; the pref is restored afterwards).
+        if Bundle.main.bundleURL.path.hasPrefix("/Applications") {
+            let wasEnabled = LoginItem.isEnabled
+            _ = LoginItem.apply(enabled: false)
+            usleep(400_000)
+            let offStatus = LoginItem.status
+            _ = LoginItem.apply(enabled: wasEnabled)
+            usleep(400_000)
+            print("登录项往返: 初始=\(wasEnabled) 关闭后=\(offStatus.rawValue) 恢复=\(LoginItem.isEnabled)")
+            if wasEnabled, offStatus == .enabled { selfTestFail("登录项无法关闭") }
+            if LoginItem.isEnabled != wasEnabled { selfTestFail("登录项状态未能恢复") }
+        } else {
+            print("登录项往返: 跳过（未安装在 /Applications）")
+        }
+
+        Prefs.refreshSeconds = selfTestOriginalInterval
+        Prefs.balloonMB = selfTestOriginalBalloon
+        if Prefs.refreshSeconds != selfTestOriginalInterval || Prefs.balloonMB != selfTestOriginalBalloon {
+            selfTestFail("偏好设置未能恢复")
+        }
+        print("偏好: 刷新 \(Prefs.refreshSeconds)s · 气球 \(Prefs.balloonMB)MB · 登录项 \(LoginItem.statusDescription)")
 
         if selfTestFailures.isEmpty {
             print("自检结果: OK（0 项失败）")

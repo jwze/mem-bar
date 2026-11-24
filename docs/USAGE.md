@@ -155,13 +155,20 @@ vmmap -summary $(pgrep -x MemBar) | grep "Physical footprint"
 
 | 指标 | 实测值 | 预算 | 结论 |
 | --- | --- | --- | --- |
-| 物理 footprint | 18.1 MB（峰值 19.7 MB） | ≤ 30 MB | ✅ |
-| RSS | 78–82 MB | — | 与空白 AppKit 菜单栏 App 基线 78.8 MB 持平（几乎全是共享 AppKit 页） |
-| 空闲 CPU | 0.0%（偶发 0.2% 为 `ps` 平均噪声） | ≤ 0.2% | ✅ |
-| 10 分钟 RSS 漂移 | 82.0 → 78.5 MB（无上升趋势） | 无泄漏 | ✅ |
+| 物理 footprint | 17.6 MB（峰值 19.8 MB） | ≤ 30 MB | ✅ |
+| RSS | 76.9 MB（稳定段 76.8–77.7 MB） | — | 与空白 AppKit 菜单栏 App 基线 78.8 MB 持平（几乎全是共享 AppKit 页） |
+| 空闲 CPU（默认 5 秒刷新） | 0.09%（10 分钟 60 次采样平均，峰值 1.6%） | ≤ 0.2% | ✅ |
+| 空闲 CPU（2 秒刷新） | 0.72% | — | 每次菜单栏文字变化约 20 ms（WindowServer 往返），刷新越快越费 CPU |
+| 10 分钟 RSS 漂移 | 76.9 → 44.0 MB（末段下降=系统回收干净页），无上升趋势 | 无泄漏 | ✅ |
 | `--diagnostics` 净 RSS | 6.4 MB | — | 纯 syscall 模式的净占用 |
 
-> RSS 把共享库的只读页也算进去，所以会看到 ~80 MB；`vmmap` 的 **Physical footprint** 才是活动监视器「内存」列的口径，也就是真正属于 MemBar 的 18 MB。
+> RSS 把共享库的只读页也算进去，所以会看到 ~77 MB；`vmmap` 的 **Physical footprint** 才是活动监视器「内存」列的口径，也就是真正属于 MemBar 的 17.4 MB。
+
+CPU 优化的三个实现细节（都在 `StatusItemController` 里）：
+
+1. 状态栏项使用**固定宽度**（64 pt）：`variableLength` 会在每次字数变化时让 WindowServer 重新排版整条菜单栏。
+2. 菜单栏文字**只在「百分比取整值」或压力等级变化时**才重绘（`renderedPercent/renderedPressure` 缓存）；tooltip 与数字同步重建，不在每个采样 tick 上重算。
+3. 明细行（已用/缓存/交换/结果行）只在**菜单打开时**重建，5 秒 tick 只做一次 syscall 采样 + 一次可能的重绘。
 
 ### 5.2 数值对照
 
@@ -181,7 +188,18 @@ vm_stat                  # 页计数原值
 ./build/MemBar.app/Contents/MacOS/MemBar --selftest
 ```
 
-检查项：菜单结构/文案/enabled 状态、紧张态红色文字与实心图标、一键清理（真实流水线）、结束进程（真实 `sleep` 子进程）、偏好读写。全部通过时输出 `自检结果: OK（0 项失败）` 并以 0 退出。
+检查项（全部通过时输出 `自检结果: OK（0 项失败）` 并以 0 退出）：
+
+| 检查 | 证据 |
+| --- | --- |
+| 菜单栏项可见 | `statusItem.isVisible=true` + 按钮帧位于菜单栏 |
+| 菜单结构/文案/enabled | 逐项打印标题与状态；摘要/交换/结果行非空，⌘K/⌘Q 存在，子菜单数量正确，未勾选时「结束选中进程」禁用 |
+| 紧张态渲染 | 合成「几乎无可回收」快照 → 断言 🔴 紧张、文字为 `NSColor.systemRed`、图标为 `memorychip.fill`，随后恢复真实采样 |
+| 刷新间隔/回收强度切换 | 切到 2 秒/128 MB 再切回原值，断言 `sampler.interval`、勾选态、`UserDefaults` 都随之变化 |
+| 一键清理 | 走 `cleanNow()` 同一路径，等待真实流水线结束并断言结果行已更新 |
+| 结束进程 | 启动真实 `sleep` 子进程 → 勾选 → 结束 → 断言进程消失、按钮回到禁用 |
+| 登录项往返 | 仅在 `/Applications` 下执行：注销 → 断言状态非 enabled → 重新注册 → 断言恢复 |
+| 偏好读写 | 恢复原值后读回比对 |
 
 ## 6. 故障排查
 
