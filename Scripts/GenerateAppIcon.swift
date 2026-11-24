@@ -2,7 +2,9 @@
 import AppKit
 import Foundation
 
-// Renders the MemBar app icon (gradient squircle + memory chip bars) into an .icns bundle.
+// Renders the MemBar app icon into an .icns bundle.
+// Design: a deep teal squircle, a white progress ring at ~72%, and three rising bars inside it —
+// the same visual language as the menu-bar capsule, and still legible at 16×16.
 // Usage: swift Scripts/GenerateAppIcon.swift <output.icns>
 
 let arguments = CommandLine.arguments
@@ -19,50 +21,91 @@ func drawIcon(in rect: CGRect) {
 
     NSGraphicsContext.current?.shouldAntialias = true
 
-    // Background squircle.
+    // MARK: Background squircle (deep teal, top-lit)
+
     let background = NSBezierPath(
-        roundedRect: rect.insetBy(dx: p(40), dy: p(40)),
-        xRadius: p(205),
-        yRadius: p(205)
+        roundedRect: rect.insetBy(dx: p(44), dy: p(44)),
+        xRadius: p(210),
+        yRadius: p(210)
     )
     let gradient = NSGradient(colors: [
-        NSColor(srgbRed: 0.20, green: 0.66, blue: 0.52, alpha: 1.0),
-        NSColor(srgbRed: 0.09, green: 0.27, blue: 0.35, alpha: 1.0),
+        NSColor(srgbRed: 0.13, green: 0.55, blue: 0.50, alpha: 1.0),
+        NSColor(srgbRed: 0.04, green: 0.17, blue: 0.24, alpha: 1.0),
     ])!
     gradient.draw(in: background, angle: -90)
 
-    // Soft highlight at the top.
-    let highlight = NSBezierPath(
-        roundedRect: CGRect(x: p(120), y: p(650), width: p(784), height: p(300)),
-        xRadius: p(150),
-        yRadius: p(150)
+    // Subtle inner rim so the tile reads as a physical chip on any wallpaper.
+    NSColor.white.withAlphaComponent(0.12).setStroke()
+    let rim = NSBezierPath(
+        roundedRect: rect.insetBy(dx: p(52), dy: p(52)),
+        xRadius: p(202),
+        yRadius: p(202)
     )
-    NSColor.white.withAlphaComponent(0.10).setFill()
-    highlight.fill()
+    rim.lineWidth = p(3)
+    rim.stroke()
 
-    // Chip body.
-    let body = NSBezierPath(
-        roundedRect: CGRect(x: p(220), y: p(220), width: p(584), height: p(584)),
-        xRadius: p(96),
-        yRadius: p(96)
+    // MARK: Progress ring
+
+    let center = CGPoint(x: rect.midX, y: rect.midY)
+    let ringRadius = p(300)
+    let ringWidth = p(74)
+
+    // Track.
+    let track = NSBezierPath()
+    track.appendArc(
+        withCenter: center,
+        radius: ringRadius,
+        startAngle: 0,
+        endAngle: 360
     )
-    NSColor.white.setFill()
-    body.fill()
+    track.lineWidth = ringWidth
+    NSColor.white.withAlphaComponent(0.16).setStroke()
+    track.stroke()
 
-    // Three memory bars, growing left to right.
-    let barColor = NSColor(srgbRed: 0.16, green: 0.48, blue: 0.42, alpha: 1.0)
-    barColor.setFill()
-    let bars: [(x: CGFloat, height: CGFloat)] = [
-        (p(316), p(200)),
-        (p(468), p(320)),
-        (p(620), p(430)),
+    // Progress: 72% of the circle, starting at 12 o'clock and running clockwise.
+    let progress: CGFloat = 0.72
+    let startAngle: CGFloat = 90
+    let endAngle = startAngle - 360 * progress
+    let arc = NSBezierPath()
+    arc.appendArc(
+        withCenter: center,
+        radius: ringRadius,
+        startAngle: startAngle,
+        endAngle: endAngle,
+        clockwise: true
+    )
+    arc.lineWidth = ringWidth
+    arc.lineCapStyle = .round
+    NSColor.white.setStroke()
+    arc.stroke()
+
+    // MARK: Three rising bars inside the ring
+
+    // Centred inside the ring: bars span from -160 to +160 and are vertically centred on the
+    // ring's centre of mass, so the group reads as balanced rather than sunk to the bottom.
+    let barWidth = p(78)
+    let gap = p(22)
+    let bars: [(index: CGFloat, height: CGFloat)] = [
+        (0, p(150)),
+        (1, p(240)),
+        (2, p(330)),
     ]
+    let totalWidth = barWidth * 3 + gap * 2
+    let baseline = rect.midY - p(165)
+
     for bar in bars {
+        let x = center.x - totalWidth / 2 + bar.index * (barWidth + gap)
         let path = NSBezierPath(
-            roundedRect: CGRect(x: bar.x, y: p(300), width: p(88), height: bar.height),
-            xRadius: p(28),
-            yRadius: p(28)
+            roundedRect: CGRect(
+                x: x,
+                y: baseline,
+                width: barWidth,
+                height: bar.height
+            ),
+            xRadius: barWidth / 2,
+            yRadius: barWidth / 2
         )
+        NSColor.white.setFill()
         path.fill()
     }
 }
@@ -110,6 +153,11 @@ for variant in variants {
     let url = iconsetURL.appendingPathComponent("\(variant.name).png")
     try pngData(size: variant.size).write(to: url)
 }
+
+// Preview of the 512 pt tile, handy when tweaking the artwork.
+let previewURL = URL(fileURLWithPath: outputPath).deletingLastPathComponent()
+    .appendingPathComponent("AppIcon-preview.png")
+try? pngData(size: 512).write(to: previewURL)
 
 let iconutil = Process()
 iconutil.executableURL = URL(fileURLWithPath: "/usr/bin/iconutil")

@@ -20,13 +20,21 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var renderedPressure: MemoryPressure?
 
     private var isCleaning = false
-    private var candidates: [ProcessSample] = []
-    private var checkedPIDs: Set<pid_t> = []
+    private var candidates: [AppGroup] = []
+    /// Checked rows, keyed by `AppGroup.key` (bundle path or executable name) — not by pid,
+    /// because one row covers several processes.
+    private var checkedKeys: Set<String> = []
+    /// Tab stop shared by every process row so their sizes form one right-aligned column.
+    private var processColumnWidth: CGFloat = 0
 
     private let placeholderImage = MenuBarBadge.image(text: "–%", pressure: .normal)
 
     private let headlineItem = NSMenuItem()
-    private let infoItem = NSMenuItem()
+    private let gaugeItem = NSMenuItem()
+    private let legendItem = NSMenuItem()
+    private let usedItem = NSMenuItem()
+    private let cacheItem = NSMenuItem()
+    private let compressedItem = NSMenuItem()
     private let swapItem = NSMenuItem()
     private let cleanItem = NSMenuItem()
     private let resultItem = NSMenuItem()
@@ -35,8 +43,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private let killSelectedItem = NSMenuItem()
     private let intervalItem = NSMenuItem()
     private let intervalMenu = NSMenu()
-    private let balloonItem = NSMenuItem()
-    private let balloonMenu = NSMenu()
     private let loginItemToggle = NSMenuItem()
     private let quitItem = NSMenuItem()
 
@@ -106,11 +112,20 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         menu.delegate = self
         menu.autoenablesItems = false
 
-        for item in [headlineItem, infoItem, swapItem, resultItem] {
+        for item in [headlineItem, gaugeItem, legendItem, usedItem, cacheItem,
+                     compressedItem, swapItem, resultItem] {
             item.isEnabled = false
+            // A brand-new NSMenuItem carries no title and NSMenu paints the class name in its
+            // place; every row must have one, even the image-only gauge.
+            item.title = ""
         }
         menu.addItem(headlineItem)
-        menu.addItem(infoItem)
+        menu.addItem(gaugeItem)
+        menu.addItem(legendItem)
+        menu.addItem(.separator())
+        menu.addItem(usedItem)
+        menu.addItem(cacheItem)
+        menu.addItem(compressedItem)
         menu.addItem(swapItem)
         menu.addItem(.separator())
 
@@ -146,21 +161,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
         menu.addItem(intervalItem)
 
-        balloonItem.title = "回收强度"
-        balloonItem.submenu = balloonMenu
-        balloonMenu.autoenablesItems = false
-        for megabytes in Prefs.balloonOptions {
-            let item = NSMenuItem(
-                title: "\(megabytes) MB",
-                action: #selector(selectBalloon(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.tag = megabytes
-            balloonMenu.addItem(item)
-        }
-        menu.addItem(balloonItem)
-
         loginItemToggle.title = "登录时自动启动"
         loginItemToggle.target = self
         loginItemToggle.action = #selector(toggleLoginItem)
@@ -177,14 +177,58 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func updateInfoItems(_ snapshot: MemorySnapshot) {
         let pressure = snapshot.pressure
-        headlineItem.title = "内存 \(Fmt.percent(snapshot.percent))"
-            + " · 已用 \(Fmt.bytes(snapshot.used)) / \(Fmt.bytes(snapshot.total))"
-        infoItem.title = "空闲 \(Fmt.bytes(snapshot.free))"
-            + " · 缓存 \(Fmt.bytes(snapshot.cache))"
-            + " · 压缩 \(Fmt.bytes(snapshot.compressed))"
-        swapItem.title = "交换 \(Fmt.bytes(snapshot.swapUsed)) / \(Fmt.bytes(snapshot.swapTotal))"
-            + " · \(pressure.dot) \(pressure.label)"
-        resultItem.title = resultText()
+
+        headlineItem.attributedTitle = MenuStyle.headline(
+            percent: Fmt.percent(snapshot.percent),
+            used: Fmt.bytes(snapshot.used),
+            total: Fmt.bytes(snapshot.total),
+            pressure: pressure
+        )
+
+        gaugeItem.image = MenuStyle.compositionBarImage(
+            used: snapshot.used,
+            cache: snapshot.cache,
+            free: snapshot.free,
+            total: snapshot.total
+        )
+        legendItem.attributedTitle = MenuStyle.compositionLegend(
+            used: snapshot.used,
+            cache: snapshot.cache,
+            free: snapshot.free,
+            total: snapshot.total
+        )
+
+        let usedLabel = "已用 · \(pressure.dot) \(pressure.label)"
+        let swapLabel = "交换 · 已用 \(Fmt.ratioPercent(snapshot.swapRatio))"
+        let column = MenuStyle.columnWidth(for: [
+            (usedLabel, Fmt.bytes(snapshot.used)),
+            ("缓存", Fmt.bytes(snapshot.cache)),
+            ("压缩", Fmt.bytes(snapshot.compressed)),
+            (swapLabel, Fmt.bytes(snapshot.swapUsed) + " / " + Fmt.bytes(snapshot.swapTotal)),
+        ])
+
+        usedItem.attributedTitle = MenuStyle.row(
+            usedLabel,
+            value: Fmt.bytes(snapshot.used),
+            valueColor: MenuStyle.color(for: pressure),
+            columnWidth: column
+        )
+        cacheItem.attributedTitle = MenuStyle.row(
+            "缓存", value: Fmt.bytes(snapshot.cache), columnWidth: column
+        )
+        compressedItem.attributedTitle = MenuStyle.row(
+            "压缩", value: Fmt.bytes(snapshot.compressed), columnWidth: column
+        )
+
+        let swapColor: NSColor = snapshot.swapRatio > 0.8 ? .systemRed : .labelColor
+        swapItem.attributedTitle = MenuStyle.row(
+            swapLabel,
+            value: "\(Fmt.bytes(snapshot.swapUsed)) / \(Fmt.bytes(snapshot.swapTotal))",
+            valueColor: swapColor,
+            columnWidth: column
+        )
+
+        resultItem.attributedTitle = MenuStyle.caption(resultText())
     }
 
     private func resultText() -> String {
@@ -215,9 +259,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         for item in intervalMenu.items {
             item.state = item.tag == Prefs.refreshSeconds ? .on : .off
         }
-        for item in balloonMenu.items {
-            item.state = item.tag == Prefs.balloonMB ? .on : .off
-        }
 
         let status = LoginItem.status
         loginItemToggle.state = status == .enabled ? .on : .off
@@ -235,11 +276,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     private func rebuildProcessMenu() {
         candidates = ProcessScanner.top(limit: 8)
-        checkedPIDs = checkedPIDs.intersection(Set(candidates.map { $0.pid }))
+        checkedKeys = checkedKeys.intersection(Set(candidates.map { $0.key }))
         renderProcessItems()
     }
 
     /// Renders the submenu from the current `candidates` (no rescan), used by the menu and the self test.
+    ///
+    /// One row per app: every helper of a browser is folded into a single entry, and checking that
+    /// entry means "quit this app", not "kill one random renderer".
     private func renderProcessItems() {
         processesMenu.removeAllItems()
 
@@ -248,16 +292,37 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             empty.isEnabled = false
             processesMenu.addItem(empty)
         } else {
-            for sample in candidates {
+            let column = MenuStyle.columnWidth(
+                for: candidates.map {
+                    (rowLabel(name: $0.displayName, processCount: $0.processCount),
+                     Fmt.bytes($0.totalResident))
+                }
+            )
+            processColumnWidth = column
+            for group in candidates {
                 let item = NSMenuItem(
-                    title: "\(displayName(for: sample))  \(Fmt.bytes(sample.resident))",
+                    title: MenuStyle.processRow(
+                        name: group.displayName,
+                        bytes: Fmt.bytes(group.totalResident),
+                        processCount: group.processCount
+                    ),
                     action: #selector(toggleProcess(_:)),
                     keyEquivalent: ""
                 )
                 item.target = self
-                item.tag = Int(sample.pid)
-                item.toolTip = "pid \(sample.pid)"
-                item.state = checkedPIDs.contains(sample.pid) ? .on : .off
+                item.tag = 0
+                item.representedObject = group.key
+                item.toolTip = group.processCount > 1
+                    ? "\(group.processCount) 个进程 · pids \(group.pids.map(String.init).joined(separator: ", "))"
+                    : "pid \(group.pids.first.map(String.init) ?? "?")"
+                item.state = checkedKeys.contains(group.key) ? .on : .off
+                item.attributedTitle = MenuStyle.processAttributedTitle(
+                    name: group.displayName,
+                    bytes: Fmt.bytes(group.totalResident),
+                    processCount: group.processCount,
+                    checked: item.state == .on,
+                    columnWidth: column
+                )
                 processesMenu.addItem(item)
             }
         }
@@ -267,24 +332,36 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         processesMenu.addItem(killSelectedItem)
     }
 
+    /// The left-hand text of a process row, i.e. everything before the tab that starts the column.
+    private func rowLabel(name: String, processCount: Int) -> String {
+        let suffix = processCount > 1 ? "  ·\(processCount)" : ""
+        return name + suffix
+    }
+
     private func updateKillItem() {
-        killSelectedItem.title = "结束选中进程 (\(checkedPIDs.count))"
-        killSelectedItem.isEnabled = !checkedPIDs.isEmpty && !isCleaning
+        let selected = candidates.filter { checkedKeys.contains($0.key) }
+        killSelectedItem.title = "结束选中应用 (\(selected.count))"
+        killSelectedItem.isEnabled = !selected.isEmpty && !isCleaning
     }
 
-    private func displayName(for sample: ProcessSample) -> String {
-        if let app = NSRunningApplication(processIdentifier: sample.pid),
-           let name = app.localizedName,
-           !name.isEmpty {
-            return name
+    /// The GUI app for a group, if any: used so quitting shows the app's own save sheet.
+    private func runningApplication(for group: AppGroup) -> NSRunningApplication? {
+        for pid in group.pids {
+            if let app = NSRunningApplication(processIdentifier: pid) {
+                return app
+            }
         }
-        return sample.name
+        return nil
     }
 
+    /// Every process of every checked app. Helpers are terminated one by one after the main
+    /// process, so a browser cannot respawn a renderer while we are still walking the list.
     private func victimsForChecked() -> [VictimProcess] {
         candidates
-            .filter { checkedPIDs.contains($0.pid) }
-            .map { VictimProcess(pid: $0.pid, name: displayName(for: $0)) }
+            .filter { checkedKeys.contains($0.key) }
+            .flatMap { group in
+                group.pids.map { VictimProcess(pid: $0, name: group.displayName) }
+            }
     }
 
     /// Graceful quit for real apps (their save sheet can appear), `SIGTERM` for plain processes.
@@ -334,7 +411,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
                 self.cleanItem.isEnabled = true
                 self.lastClean = outcome
                 self.lastCleanAt = Date()
-                self.checkedPIDs.removeAll()
+                self.checkedKeys.removeAll()
                 self.rebuildProcessMenu()
                 self.apply(MemoryStats.sample())
                 if let snapshot = self.snapshot { self.updateInfoItems(snapshot) }
@@ -354,7 +431,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             let result = Reclaimer.terminate(victims, graceful: StatusItemController.gracefulTerminate)
             guard let self else { return }
             DispatchQueue.main.async {
-                self.checkedPIDs.removeAll()
+                self.checkedKeys.removeAll()
                 if result.stuck.isEmpty {
                     self.lastKill = ("上次结束：\(names) · 已结束", Date())
                 } else {
@@ -372,13 +449,24 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     }
 
     @objc private func toggleProcess(_ sender: NSMenuItem) {
-        let pid = pid_t(sender.tag)
-        if sender.state == .on {
-            sender.state = .off
-            checkedPIDs.remove(pid)
+        guard let key = sender.representedObject as? String else { return }
+        let checked: Bool
+        if checkedKeys.contains(key) {
+            checkedKeys.remove(key)
+            checked = false
         } else {
-            sender.state = .on
-            checkedPIDs.insert(pid)
+            checkedKeys.insert(key)
+            checked = true
+        }
+        sender.state = checked ? .on : .off
+        if let group = candidates.first(where: { $0.key == key }) {
+            sender.attributedTitle = MenuStyle.processAttributedTitle(
+                name: group.displayName,
+                bytes: Fmt.bytes(group.totalResident),
+                processCount: group.processCount,
+                checked: checked,
+                columnWidth: processColumnWidth
+            )
         }
         updateKillItem()
     }
@@ -389,11 +477,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         updateSubmenuChecks()
     }
 
-    @objc private func selectBalloon(_ sender: NSMenuItem) {
-        Prefs.balloonMB = sender.tag
-        updateSubmenuChecks()
-    }
-
     @objc private func toggleLoginItem() {
         let enable = !LoginItem.isEnabled
         LoginItem.apply(enabled: enable)
@@ -401,7 +484,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             lastKill = ("登录项未生效：\(LoginItem.statusDescription)", Date())
         }
         updateSubmenuChecks()
-        resultItem.title = resultText()
+        resultItem.attributedTitle = MenuStyle.caption(resultText())
         Log.info("login item toggle enable=\(enable) status=\(LoginItem.statusDescription)")
     }
 
@@ -422,7 +505,6 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var selfTestChild: pid_t = 0
     private var selfTestDeadline = Date()
     private var selfTestOriginalInterval = Prefs.defaultRefreshSeconds
-    private var selfTestOriginalBalloon = Prefs.defaultBalloonMB
 }
 // MARK: - Self test (`MemBar --selftest`)
 
@@ -432,7 +514,6 @@ extension StatusItemController {
     func runSelfTest() {
         var failures: [String] = []
         selfTestOriginalInterval = Prefs.refreshSeconds
-        selfTestOriginalBalloon = Prefs.balloonMB
         apply(MemoryStats.sample())
         print("\(AppInfo.name) \(AppInfo.version) 自检")
         print("菜单栏徽章: \(statusItem.button?.image?.size.debugDescription ?? "无")"
@@ -445,16 +526,25 @@ extension StatusItemController {
         menuWillOpen(menu)
         print("菜单结构:")
         for item in menu.items {
-            print("  - \(item.isSeparatorItem ? "──" : item.title) enabled=\(item.isEnabled) state=\(item.state.rawValue)")
+            let label = (item.attributedTitle?.length ?? 0) > 0 ? item.attributedTitle!.string : item.title
+            print("  - \(item.isSeparatorItem ? "──" : label) enabled=\(item.isEnabled) state=\(item.state.rawValue)")
         }
-        if !headlineItem.title.contains("内存") { failures.append("摘要行文案异常: \(headlineItem.title)") }
-        if !swapItem.title.contains("交换") { failures.append("交换行文案异常: \(swapItem.title)") }
-        if !resultItem.title.contains("上次清理") { failures.append("结果行文案异常: \(resultItem.title)") }
+        let headlineText = headlineItem.attributedTitle?.string ?? ""
+        let swapText = swapItem.attributedTitle?.string ?? ""
+        let resultTextValue = resultItem.attributedTitle?.string ?? ""
+        if !headlineText.contains("%") || !headlineText.contains("/") {
+            failures.append("摘要行文案异常: \(headlineText)")
+        }
+        if !swapText.contains("交换") { failures.append("交换行文案异常: \(swapText)") }
+        if !resultTextValue.contains("上次清理") {
+            failures.append("结果行文案异常: \(resultTextValue)")
+        }
+        if gaugeItem.image == nil { failures.append("构成条图片缺失") }
+        if (legendItem.attributedTitle?.string ?? "").isEmpty { failures.append("图例为空") }
         if cleanItem.action == nil { failures.append("一键清理没有绑定 action") }
         if cleanItem.keyEquivalent != "k" { failures.append("一键清理缺少 ⌘K") }
         if processesItem.submenu == nil { failures.append("高占用进程没有子菜单") }
         if intervalItem.submenu?.items.count != Prefs.refreshOptions.count { failures.append("刷新间隔选项数量异常") }
-        if balloonItem.submenu?.items.count != Prefs.balloonOptions.count { failures.append("回收强度选项数量异常") }
         if killSelectedItem.isEnabled { failures.append("未勾选时「结束选中进程」应为禁用") }
 
         // Pressure rendering: a synthetic "almost nothing reclaimable" snapshot must repaint the
@@ -493,7 +583,7 @@ extension StatusItemController {
             selfTestFail("恢复正常后徽章仍为紧张配色")
         }
 
-        // Interval / balloon menu wiring.
+        // Refresh-interval menu wiring.
         if let twoSeconds = intervalMenu.items.first(where: { $0.tag == 2 }) {
             selectInterval(twoSeconds)
             if sampler?.interval != 2 { selfTestFail("刷新间隔未生效") }
@@ -504,14 +594,7 @@ extension StatusItemController {
         if let defaultInterval = intervalMenu.items.first(where: { $0.tag == selfTestOriginalInterval }) {
             selectInterval(defaultInterval)
         }
-        if let bigBalloonItem = balloonMenu.items.first(where: { $0.tag == 128 }) {
-            selectBalloon(bigBalloonItem)
-            if Prefs.balloonMB != 128 { selfTestFail("回收强度未持久化") }
-        }
-        if let defaultBalloon = balloonMenu.items.first(where: { $0.tag == selfTestOriginalBalloon }) {
-            selectBalloon(defaultBalloon)
-        }
-        print("偏好切换: 刷新→2s 再回到 \(selfTestOriginalInterval)s · 气球→128MB 再回到 \(selfTestOriginalBalloon)MB")
+        print("偏好切换: 刷新→2s 再回到 \(selfTestOriginalInterval)s")
         if let quitMenu = menu.items.first(where: { $0 === quitItem }), quitMenu.keyEquivalent != "q" {
             selfTestFail("退出缺少 ⌘Q")
         }
@@ -567,7 +650,9 @@ extension StatusItemController {
                 print("  之后 free=\(Fmt.bytes(outcome.after.free)) compressed=\(Fmt.bytes(outcome.after.compressed))")
                 print("菜单栏徽章（清理后）: \(statusItem.button?.image?.size.debugDescription ?? "无")")
                 if !outcome.balloonRan { selfTestFail("气球子进程未执行") }
-                if !resultItem.title.contains("上次清理") { selfTestFail("结果行没有更新") }
+                if !(resultItem.attributedTitle?.string ?? "").contains("上次清理") {
+                    selfTestFail("结果行没有更新")
+                }
                 if let before = selfTestBefore {
                     let delta = Int64(outcome.after.free) - Int64(before.free)
                     print("清理前后空闲变化: \(Fmt.deltaBytes(delta))")
@@ -583,11 +668,15 @@ extension StatusItemController {
             }
             selfTestChild = child
             rebuildProcessMenu()
-            candidates.insert(
-                ProcessSample(pid: child, name: "selftest-sleeper", resident: 1, uid: geteuid()),
-                at: 0
+            let sleeperGroup = AppGroup(
+                key: "selftest-sleeper",
+                displayName: "selftest-sleeper",
+                totalResident: 1,
+                pids: [child],
+                isApplication: false
             )
-            checkedPIDs = [child]
+            candidates.insert(sleeperGroup, at: 0)
+            checkedKeys = [sleeperGroup.key]
             renderProcessItems()
             print("高占用进程子菜单:")
             for item in processesMenu.items {
@@ -638,11 +727,10 @@ extension StatusItemController {
         }
 
         Prefs.refreshSeconds = selfTestOriginalInterval
-        Prefs.balloonMB = selfTestOriginalBalloon
-        if Prefs.refreshSeconds != selfTestOriginalInterval || Prefs.balloonMB != selfTestOriginalBalloon {
+        if Prefs.refreshSeconds != selfTestOriginalInterval {
             selfTestFail("偏好设置未能恢复")
         }
-        print("偏好: 刷新 \(Prefs.refreshSeconds)s · 气球 \(Prefs.balloonMB)MB · 登录项 \(LoginItem.statusDescription)")
+        print("偏好: 刷新 \(Prefs.refreshSeconds)s · 登录项 \(LoginItem.statusDescription)")
 
         if selfTestFailures.isEmpty {
             print("自检结果: OK（0 项失败）")

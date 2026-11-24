@@ -9,6 +9,7 @@ DerivedData/
 
 # ── 构建时生成、不入库的资源 ─────────────────────────────
 Resources/AppIcon.icns
+Resources/AppIcon-preview.png
 
 # ── 编译中间件 ───────────────────────────────────────────
 *.o
