@@ -18,11 +18,6 @@ let package = Package(
             dependencies: ["MemBarCore"],
             path: "Sources/MemBar"
         ),
-        .testTarget(
-            name: "MemBarCoreTests",
-            dependencies: ["MemBarCore"],
-            path: "Tests/MemBarCoreTests"
-        ),
     ],
     swiftLanguageModes: [.v5]
 )

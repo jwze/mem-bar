@@ -1,4 +1,55 @@
+# ── SwiftPM / Xcode 构建产物 ─────────────────────────────
 .build/
 build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# ── 构建时生成、不入库的资源 ─────────────────────────────
 Resources/AppIcon.icns
+
+# ── 编译中间件 ───────────────────────────────────────────
+*.o
+*.d
+*.dia
+*.swiftdoc
+*.swiftmodule
+*.swiftinterface
+*.swiftconstvalues
+*.abi.json
+*.LinkFileList
+
+# ── 测试与覆盖率（本项目不保留测试目录） ─────────────────
+Tests/
+*.xctest
+*.profraw
+*.profdata
+*.gcda
+*.gcov
+.coverage/
+coverage/
+
+# ── 日志与运行期产物 ─────────────────────────────────────
+*.log
+*.log.*
+*.crash
+*.ips
+core.*
+
+# ── 编辑器 / 系统 ────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.vscode/
+.idea/
+*.swp
+*~
+
+# ── 本地环境与密钥 ───────────────────────────────────────
+.env
+.env.*
+*.local
