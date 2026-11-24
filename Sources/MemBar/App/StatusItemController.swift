@@ -23,8 +23,7 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var candidates: [ProcessSample] = []
     private var checkedPIDs: Set<pid_t> = []
 
-    private let idleImage: NSImage? = StatusItemController.symbol("memorychip")
-    private let criticalImage: NSImage? = StatusItemController.symbol("memorychip.fill")
+    private let placeholderImage = MenuBarBadge.image(text: "–%", pressure: .normal)
 
     private let headlineItem = NSMenuItem()
     private let infoItem = NSMenuItem()
@@ -43,8 +42,9 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     override init() {
         // Fixed width: a variable-length item forces the window server to re-lay-out the whole
-        // menu bar on every percentage change, which dominates the app's CPU time.
-        self.statusItem = NSStatusBar.system.statusItem(withLength: 64)
+        // menu bar on every percentage change, which dominates the app's CPU time. The badge is
+        // sized for the widest label ("100%") and every state reuses that width.
+        self.statusItem = NSStatusBar.system.statusItem(withLength: MenuBarBadge.fixedWidth)
         super.init()
         configureButton()
         configureMenu()
@@ -65,32 +65,13 @@ final class StatusItemController: NSObject, NSMenuDelegate {
 
     // MARK: - Status button
 
-    private static func symbol(_ name: String) -> NSImage? {
-        let image = NSImage(systemSymbolName: name, accessibilityDescription: "MemBar 内存监控")
-        image?.isTemplate = true
-        return image
-    }
-
     private func configureButton() {
         guard let button = statusItem.button else { return }
-        button.image = idleImage
-        button.imagePosition = .imageLeading
-        button.title = " –%"
+        button.image = placeholderImage
+        button.imagePosition = .imageOnly
+        button.imageScaling = .scaleNone
         button.toolTip = "MemBar 内存监控"
         statusItem.menu = menu
-    }
-
-    private func statusTitle(_ text: String, pressure: MemoryPressure) -> NSAttributedString {
-        let weight: NSFont.Weight = pressure.isCritical ? .semibold : .regular
-        let color: NSColor = pressure.isCritical ? .systemRed : .labelColor
-        return NSAttributedString(
-            string: text,
-            attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 11, weight: weight),
-                .foregroundColor: color,
-                .baselineOffset: 0.5,
-            ]
-        )
     }
 
     private func apply(_ snapshot: MemorySnapshot) {
@@ -105,17 +86,14 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         if percent != renderedPercent || pressure != renderedPressure {
             renderedPercent = percent
             renderedPressure = pressure
-            button.image = pressure.isCritical ? criticalImage : idleImage
-            if pressure.isCritical {
-                button.attributedTitle = statusTitle(" \(Fmt.percent(snapshot.percent))", pressure: pressure)
-            } else {
-                // A plain title is far cheaper to re-lay-out than an attributed one, and the menu
-                // bar already renders it with the system font.
-                button.title = " \(Fmt.percent(snapshot.percent))"
-            }
+            let text = Fmt.percent(snapshot.percent)
+            button.image = MenuBarBadge.image(text: text, pressure: pressure)
+            button.setAccessibilityLabel(
+                MenuBarBadge.accessibilityDescription(text: text, pressure: pressure)
+            )
             // Tooltip text costs a handful of ByteCountFormatter calls; only rebuild it together
-            // with the title, not on every sampling tick.
-            button.toolTip = "内存 \(Fmt.percent(snapshot.percent))"
+            // with the badge, not on every sampling tick.
+            button.toolTip = "内存 \(text)"
                 + " · 已用 \(Fmt.bytes(snapshot.used)) / \(Fmt.bytes(snapshot.total))"
                 + " · 交换 \(Fmt.bytes(snapshot.swapUsed))"
                 + " · \(pressure.dot) \(pressure.label)"
@@ -457,7 +435,9 @@ extension StatusItemController {
         selfTestOriginalBalloon = Prefs.balloonMB
         apply(MemoryStats.sample())
         print("\(AppInfo.name) \(AppInfo.version) 自检")
-        print("菜单栏文字: \(statusItem.button?.attributedTitle.string ?? "<空>")")
+        print("菜单栏徽章: \(statusItem.button?.image?.size.debugDescription ?? "无")"
+            + " · 宽度 \(statusItem.length)"
+            + " · 压力 \(snapshot?.pressure.label ?? "无")")
         print("菜单栏项可见: \(statusItem.isVisible) · 按钮帧: \(statusItem.button?.window?.frame.debugDescription ?? "无")")
         if !statusItem.isVisible { selfTestFail("状态栏项不可见") }
         if statusItem.button?.image == nil { failures.append("菜单栏图标缺失") }
@@ -477,8 +457,8 @@ extension StatusItemController {
         if balloonItem.submenu?.items.count != Prefs.balloonOptions.count { failures.append("回收强度选项数量异常") }
         if killSelectedItem.isEnabled { failures.append("未勾选时「结束选中进程」应为禁用") }
 
-        // Pressure rendering: a synthetic "almost nothing reclaimable" snapshot must turn the
-        // menu-bar title red and switch to the filled icon.
+        // Pressure rendering: a synthetic "almost nothing reclaimable" snapshot must repaint the
+        // badge with the critical colour, and going back must restore the calm colour.
         let criticalSnapshot = MemoryMath.snapshot(
             pages: VMPageCounts(
                 free: 0, active: 9_000, inactive: 500, wired: 500,
@@ -490,25 +470,28 @@ extension StatusItemController {
             swapUsed: 0
         )
         apply(criticalSnapshot)
-        let titleColor = statusItem.button?.attributedTitle.attribute(
-            .foregroundColor,
-            at: 0,
-            effectiveRange: nil
-        ) as? NSColor
         print("紧张渲染: \(criticalSnapshot.pressure.dot) \(criticalSnapshot.pressure.label)"
-            + " 文字=\(statusItem.button?.attributedTitle.string ?? "")"
-            + " 颜色=\(titleColor.map { $0 == .systemRed ? "红" : "\($0)" } ?? "无")")
+            + " 徽章=\(statusItem.button?.image?.size.debugDescription ?? "无")"
+            + " 宽度=\(statusItem.length)")
         if criticalSnapshot.pressure != .critical { selfTestFail("合成快照未判为紧张") }
-        if titleColor != .systemRed { selfTestFail("紧张状态未使用红色文字") }
-        if statusItem.button?.image !== criticalImage { selfTestFail("紧张状态未使用实心图标") }
+        if statusItem.button?.image !== MenuBarBadge.image(
+            text: Fmt.percent(criticalSnapshot.percent),
+            pressure: .critical
+        ) {
+            selfTestFail("紧张状态未使用红色徽章")
+        }
+        if abs(statusItem.length - MenuBarBadge.fixedWidth) > 0.5 {
+            selfTestFail("状态栏项宽度不是固定值: \(statusItem.length)")
+        }
         apply(MemoryStats.sample())
-        let restoredColor = statusItem.button?.attributedTitle.attribute(
-            .foregroundColor,
-            at: 0,
-            effectiveRange: nil
-        ) as? NSColor
-        print("恢复正常: 文字=\(statusItem.button?.title ?? "") 颜色=\(restoredColor == .systemRed ? "红" : "默认")")
-        if restoredColor == .systemRed { selfTestFail("恢复正常后文字仍为红色") }
+        print("恢复正常: 徽章=\(statusItem.button?.image?.size.debugDescription ?? "无")"
+            + " 压力=\(snapshot?.pressure.label ?? "无")")
+        if statusItem.button?.image === MenuBarBadge.image(
+            text: Fmt.percent(snapshot?.percent ?? 0),
+            pressure: .critical
+        ) {
+            selfTestFail("恢复正常后徽章仍为紧张配色")
+        }
 
         // Interval / balloon menu wiring.
         if let twoSeconds = intervalMenu.items.first(where: { $0.tag == 2 }) {
@@ -531,6 +514,29 @@ extension StatusItemController {
         print("偏好切换: 刷新→2s 再回到 \(selfTestOriginalInterval)s · 气球→128MB 再回到 \(selfTestOriginalBalloon)MB")
         if let quitMenu = menu.items.first(where: { $0 === quitItem }), quitMenu.keyEquivalent != "q" {
             selfTestFail("退出缺少 ⌘Q")
+        }
+
+        // Badge rendering: one cached image per (text, pressure) pair, identical objects for the
+        // same pair, and a distinct image per level so the colour really changes.
+        let sampleText = "42%"
+        let normalBadge = MenuBarBadge.image(text: sampleText, pressure: .normal)
+        let elevatedBadge = MenuBarBadge.image(text: sampleText, pressure: .elevated)
+        let criticalBadge = MenuBarBadge.image(text: sampleText, pressure: .critical)
+        print("徽章缓存: 相同入参同一对象=\(normalBadge === MenuBarBadge.image(text: sampleText, pressure: .normal))"
+            + " · 三种等级互不相同=\(normalBadge !== elevatedBadge && elevatedBadge !== criticalBadge)"
+            + " · 尺寸=\(normalBadge.size.debugDescription)")
+        if normalBadge !== MenuBarBadge.image(text: sampleText, pressure: .normal) {
+            selfTestFail("徽章未按 (文字, 等级) 缓存")
+        }
+        if normalBadge === elevatedBadge || elevatedBadge === criticalBadge || normalBadge === criticalBadge {
+            selfTestFail("不同压力等级共用了同一徽章图片")
+        }
+        for pressure in MemoryPressure.allCases {
+            let badge = MenuBarBadge.image(text: "100%", pressure: pressure)
+            if abs(badge.size.width - MenuBarBadge.fixedWidth) > 0.5
+                || abs(badge.size.height - MenuBarBadge.height) > 0.5 {
+                selfTestFail("徽章尺寸不固定: \(badge.size) @\(pressure.label)")
+            }
         }
 
         selfTestFailures = failures
@@ -559,7 +565,7 @@ extension StatusItemController {
                 print("一键清理: \(outcome.detailText)")
                 print("  之前 free=\(Fmt.bytes(outcome.before.free)) compressed=\(Fmt.bytes(outcome.before.compressed))")
                 print("  之后 free=\(Fmt.bytes(outcome.after.free)) compressed=\(Fmt.bytes(outcome.after.compressed))")
-                print("菜单栏文字（清理后）: \(statusItem.button?.attributedTitle.string ?? "<空>")")
+                print("菜单栏徽章（清理后）: \(statusItem.button?.image?.size.debugDescription ?? "无")")
                 if !outcome.balloonRan { selfTestFail("气球子进程未执行") }
                 if !resultItem.title.contains("上次清理") { selfTestFail("结果行没有更新") }
                 if let before = selfTestBefore {

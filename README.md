@@ -1,10 +1,14 @@
 # MemBar
 
 macOS 菜单栏内存监控 + 一键清理。原生 Swift / AppKit，零第三方依赖，无 Dock 图标，不要 root，不要辅助功能授权。
+```
+ ╭──────╮  ╭──────╮  ╭──────╮
+ │ 41%  │  │ 71%  │  │ 93%  │   ← 圆角胶囊，颜色随压力等级变化
+ ╰──────╯  ╰──────╯  ╰──────╯
+   绿         黄         红
+```
 
-```
-🧠 71%   ← 菜单栏实时百分比（紧张时变红）
-```
+菜单栏项是**自绘固定宽度徽章**（45×18 pt，按 `100%` 定宽）：压力色胶囊 + 白色等宽数字，2× 位图渲染保证 Retina 清晰，图片按 `(百分比, 等级)` 缓存，只在取整百分比或压力等级变化时重绘。
 
 - **看内存**：菜单栏实时百分比，菜单里给出空闲 / 缓存 / 压缩 / 交换 / 压力分级。
 - **一键清理**：`⌘K` 释放自身内存 → 内存气球子进程 →（可选）结束勾选的高占用进程，并如实回显结果。
@@ -45,7 +49,7 @@ MemBar/
    │  └─ Support/{AppInfo,Log,Prefs,Fmt}.swift
    └─ MemBar/                        # AppKit 外壳
       ├─ main.swift                  # 参数分流（balloon / clean / diagnostics / selftest）
-      └─ App/{AppDelegate,StatusItemController,Sampler,LoginItem,SingleInstance}.swift
+      └─ App/{AppDelegate,StatusItemController,MenuBarBadge,Sampler,LoginItem,SingleInstance}.swift
 ```
 
 ## 常用命令
