@@ -16,7 +16,7 @@ APP="$ROOT/build/$APP_NAME.app"
 BUILD_TIMEOUT="${BUILD_TIMEOUT:-60}"
 
 if ! [[ "$BUILD_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
-  echo "error: BUILD_TIMEOUT 必须是正整数（当前：$BUILD_TIMEOUT）" >&2
+  echo "error: BUILD_TIMEOUT 必须是正整数（当前：${BUILD_TIMEOUT}）" >&2
   exit 1
 fi
 
@@ -30,10 +30,10 @@ step() {
   shift
   local left=$(( DEADLINE - SECONDS ))
   if [ "$left" -le 0 ]; then
-    echo "error: 构建已用完 ${BUILD_TIMEOUT}s 预算（$label 未开始），判定失败" >&2
+    echo "error: 构建已用完 ${BUILD_TIMEOUT}s 预算（${label} 未开始），判定失败" >&2
     exit 1
   fi
-  echo "==> $label（预算剩余 ${left}s）" >&2
+  echo "==> ${label}（预算剩余 ${left}s）" >&2
   local status=0
   run_with_timeout "$left" "$@" || status=$?
   if [ "$status" -eq 124 ]; then
@@ -41,7 +41,7 @@ step() {
     exit 1
   fi
   if [ "$status" -ne 0 ]; then
-    echo "error: $label 失败（退出码 $status）" >&2
+    echo "error: ${label} 失败（退出码 ${status}）" >&2
     exit "$status"
   fi
 }
@@ -85,4 +85,4 @@ step "codesign verify" codesign --verify --strict "$APP"
 step "smoke test (--diagnostics)" \
   "$APP/Contents/MacOS/$APP_NAME" --diagnostics | sed 's/^/    /'
 
-echo "ok: $APP（$(du -sh "$APP" | cut -f1)，用时 $(( SECONDS - START ))s / 上限 ${BUILD_TIMEOUT}s）"
+echo "ok: ${APP}（$(du -sh "$APP" | cut -f1)，用时 $(( SECONDS - START ))s / 上限 ${BUILD_TIMEOUT}s）"

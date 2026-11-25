@@ -444,22 +444,36 @@ final class PanelProcessesCard: NSView {
     enum Layout {
         static let header: CGFloat = 28
         static let headerGap: CGFloat = 4
-        static let row: CGFloat = 34
-        static let checkbox: CGFloat = 15
-        static let checkGap: CGFloat = 10
+        static let row: CGFloat = 30
+        /// Gap between two rows: the occupancy fill must read as separate bars, not one column.
+        static let rowGap: CGFloat = 3
         static let footer: CGFloat = 34
         static let footerGap: CGFloat = 8
         static let backWidth: CGFloat = 56
-        /// Rank bar under each row: thin enough to sit behind the text without competing with it.
-        static let bar: CGFloat = 3
-        static let barInset: CGFloat = 2
+        /// Horizontal padding inside a row, so text never touches the card edge.
+        static let rowInset: CGFloat = 9
+        static let rowCorner: CGFloat = 6
+        /// Right-aligned size column; measured once from the widest string.
+        static let valueGap: CGFloat = 8
+        /// The 进程 count follows the name; the bar lane starts at one shared x for every row.
+        static let countGap: CGFloat = 6
+        static let barGap: CGFloat = 8
+        static let barHeight: CGFloat = 8
+        /// A tiny row must still show a sliver, otherwise the ranking has holes in it.
+        static let barMinWidth: CGFloat = 3
+        /// The name column gets roughly half the card; long names truncate rather than starve the bar.
+        static let nameColumnShare: CGFloat = 0.54
+        /// The name column never drops below this.
+        static let nameColumnMin: CGFloat = 84
+        /// And the bar lane never shrinks below this, so the ranking stays readable.
+        static let minBarLane: CGFloat = 56
     }
 
     struct Row: Equatable {
         var key: String
         var name: String
         var bytes: String
-        /// Raw resident size, only used to size the rank bar.
+        /// Raw resident size, only used to size the occupancy fill.
         var size: UInt64
         var processCount: Int
         var checked: Bool
@@ -537,11 +551,14 @@ final class PanelProcessesCard: NSView {
                     + row.bytes
             )
         }
-        lines.append(
-            isKillAvailable
-                ? killButton.title
-                : (isBusy ? "正在清理…" : "点按应用即可勾选，可多选结束")
-        )
+        // No hint line: when nothing is checked the card simply ends after the last row, and the
+        // footer (button) does not exist at all. Saying "点按即可勾选" is what made this read as a
+        // half-finished list.
+        if isKillAvailable {
+            lines.append(killButton.title)
+        } else if isBusy {
+            lines.append("正在清理…")
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -550,7 +567,8 @@ final class PanelProcessesCard: NSView {
     private struct Frames {
         var back: NSRect
         var rowRects: [NSRect]
-        var footer: NSRect
+        /// `nil` when nothing is checked: the card then ends after the last row.
+        var footer: NSRect?
         var height: CGFloat
     }
 
@@ -564,82 +582,105 @@ final class PanelProcessesCard: NSView {
         )
         y += Layout.header + Layout.headerGap
         var rects: [NSRect] = []
-        for _ in rows {
+        for index in rows.indices {
+            if index > 0 { y += Layout.rowGap }
             rects.append(NSRect(x: 0, y: y, width: PanelRowMetrics.width, height: Layout.row))
             y += Layout.row
         }
-        y += Layout.footerGap
-        let footer = NSRect(x: 0, y: y, width: PanelRowMetrics.width, height: Layout.footer)
-        y += Layout.footer + PanelRowMetrics.bottomPadding
+        // Dynamic height instead of a fixed 34pt strip: an unchecked list has nothing to offer, so
+        // the popover shrinks by exactly the footer's height and the button appears with the
+        // first check.
+        var footer: NSRect?
+        if isKillAvailable {
+            y += Layout.footerGap
+            footer = NSRect(x: 0, y: y, width: PanelRowMetrics.width, height: Layout.footer)
+            y += Layout.footer
+        }
+        y += PanelRowMetrics.bottomPadding
         return Frames(back: back, rowRects: rects, footer: footer, height: y)
     }
 
     override func layout() {
         super.layout()
-        let footer = frames.footer
-        killButton.frame = NSRect(
-            x: PanelRowMetrics.inset,
-            y: footer.minY,
-            width: bounds.width - PanelRowMetrics.inset * 2,
-            height: Layout.footer
-        )
+        // Hidden with the footer: a button floating below a shorter card would be clipped anyway.
+        killButton.frame = frames.footer.map {
+            NSRect(
+                x: PanelRowMetrics.inset,
+                y: $0.minY,
+                width: bounds.width - PanelRowMetrics.inset * 2,
+                height: Layout.footer
+            )
+        } ?? .zero
     }
 
     private var contentWidth: CGFloat {
         bounds.width - PanelRowMetrics.inset * 2
     }
 
-    private func checkboxRect(in rowRect: NSRect) -> NSRect {
-        NSRect(
-            x: PanelRowMetrics.inset,
-            y: rowRect.midY - Layout.checkbox / 2,
-            width: Layout.checkbox,
-            height: Layout.checkbox
-        )
+    /// Right edge of the size column. Measured once from the widest string so the column never
+    /// jumps between rows.
+    private var valueRight: CGFloat {
+        PanelRowMetrics.width - PanelRowMetrics.inset
     }
 
-    private func nameOriginX(in rowRect: NSRect) -> CGFloat {
-        checkboxRect(in: rowRect).maxX + Layout.checkGap
+    private var valueWidth: CGFloat {
+        rows.map { MenuStyle.width($0.bytes, font: MenuStyle.valueFont) }.max() ?? 40
     }
 
-    /// The rank bar lives inside the name column: it must never look like an underline for the
-    /// size column, and every bar shares one baseline so the list reads as a ranking.
+    private var valueX: CGFloat { valueRight - valueWidth }
+
+    /// Left edge of the name column.
+    private var nameColumnX: CGFloat { PanelRowMetrics.inset + Layout.rowInset }
+
+    private var widestName: CGFloat { rows.map { nameWidth($0) }.max() ?? 0 }
+
+    /// Width of the name column: as wide as the longest name wants, inside a fixed share of the
+    /// card. Reserving a separate column for the 进程 count is what truncated "Google Chrome" to
+    /// "Goog…", so the count is drawn inside this column only when it still fits.
+    private var nameColumn: CGFloat {
+        let cap = (PanelRowMetrics.width - PanelRowMetrics.inset * 2) * Layout.nameColumnShare
+        let upper = min(widestName, cap)
+        let lower = max(Layout.nameColumnMin, upper)
+        let budget = fillLimit - nameColumnX - Layout.barGap - Layout.minBarLane
+        return max(Layout.nameColumnMin, min(lower, budget))
+    }
+
+    /// One shared x for every bar, so the lane reads as a column and not as a ragged edge.
+    private var barLaneX: CGFloat { nameColumnX + nameColumn + Layout.barGap }
+
+    private var barLaneWidth: CGFloat { max(0, fillLimit - barLaneX) }
+
+    /// Where the bar lane ends: before the size column, so the number always sits on plain ground.
+    private var fillLimit: CGFloat { valueX - Layout.valueGap }
+
+    private func nameWidth(_ row: Row) -> CGFloat {
+        MenuStyle.width(row.name, font: nameFont(for: row))
+    }
+    private func nameFont(for row: Row) -> NSFont {
+        row.checked ? MenuStyle.sectionFont : MenuStyle.rowLabelFont
+    }
+
+    /// `名称 ·N ████████░░░░  大小` — the bar is its own lane between the text and the size.
+    ///
+    /// The first attempt filled the whole row instead, which swallowed the text and made each row
+    /// look like a differently sized pill. A dedicated lane keeps the labels on plain background
+    /// and still turns the ranking into one readable column.
     private func barRect(in rowRect: NSRect, fraction: Double) -> NSRect {
-        let startX = nameOriginX(in: rowRect)
-        let full = columns(in: rowRect).barWidth
-        let width = max(Layout.bar, full * CGFloat(min(1, max(0, fraction))))
+        let lane = barLaneWidth
+        guard lane > 0 else { return .zero }
+        let width = max(Layout.barMinWidth, lane * CGFloat(min(1, max(0, fraction))))
         return NSRect(
-            x: startX,
-            y: rowRect.maxY - Layout.bar - Layout.barInset,
+            x: barLaneX,
+            y: rowRect.midY - Layout.barHeight / 2,
             width: width,
-            height: Layout.bar
-        )
-    }
-
-    /// One grid for every row: `[✓] 名称 ·N ……… 大小`.
-    private struct Columns {
-        var nameX: CGFloat
-        var valueX: CGFloat
-        var valueWidth: CGFloat
-        var barWidth: CGFloat
-    }
-
-    private func columns(in rowRect: NSRect, hint: Row? = nil) -> Columns {
-        // Measured against the widest size string so the name column never jumps between rows.
-        let widest = rows.map { MenuStyle.width($0.bytes, font: MenuStyle.valueFont) }.max() ?? 40
-        let valueX = PanelRowMetrics.width - PanelRowMetrics.inset - widest
-        let nameX = nameOriginX(in: rowRect)
-        return Columns(
-            nameX: nameX,
-            valueX: valueX,
-            valueWidth: widest,
-            barWidth: max(Layout.bar, valueX - nameX - 8)
+            height: Layout.barHeight
         )
     }
 
     private func rowIndex(at point: NSPoint) -> Int? {
         frames.rowRects.firstIndex { $0.contains(point) }
     }
+
 
     private func refreshTrackingAreas() {
         for area in trackingAreas_ { removeTrackingArea(area) }
@@ -713,39 +754,66 @@ final class PanelProcessesCard: NSView {
         let maxSize = rows.map(\.size).max() ?? 0
         for (index, row) in rows.enumerated() {
             let rect = frames.rowRects[index]
-            if let fill = PanelRowMetrics.rowBackground(
+            drawRowBackground(
+                for: row,
+                in: rect,
                 hovered: hoveredRow == index,
                 pressed: pressedRow == index
-            ) {
-                fill.setFill()
-                NSBezierPath(
-                    roundedRect: rect.insetBy(dx: PanelRowMetrics.inset - 8, dy: 1),
-                    xRadius: PanelRowMetrics.rowCorner,
-                    yRadius: PanelRowMetrics.rowCorner
-                ).fill()
-            }
+            )
             if maxSize > 0 {
-                NSColor.controlAccentColor.withAlphaComponent(row.checked ? 0.55 : 0.28).setFill()
-                let bar = barRect(in: rect, fraction: Double(row.size) / Double(maxSize))
-                NSBezierPath(roundedRect: bar, xRadius: Layout.bar / 2, yRadius: Layout.bar / 2).fill()
+                drawBar(for: row, in: rect, fraction: Double(row.size) / Double(maxSize))
             }
             drawRow(row, in: rect)
         }
+        // No hint text and no reserved strip: the footer only exists while the button does.
+    }
 
-        if !isKillAvailable {
-            let hint = isBusy ? "正在清理…" : "点按应用即可勾选，可多选结束"
-            let size = MenuStyle.size(hint, font: MenuStyle.captionFont)
-            (hint as NSString).draw(
-                at: NSPoint(
-                    x: PanelRowMetrics.inset,
-                    y: frames.footer.midY - size.height / 2
-                ),
-                withAttributes: [
-                    .font: MenuStyle.captionFont,
-                    .foregroundColor: NSColor.labelColor,
-                ]
-            )
-        }
+    /// Row wash first, then the bar: the bar keeps its own accent strength so a hovered row does
+    /// not change the ranking colour.
+    private func drawRowBackground(
+        for row: Row,
+        in rect: NSRect,
+        hovered: Bool,
+        pressed: Bool
+    ) {
+        let wash = PanelRowMetrics.rowBackground(hovered: hovered, pressed: pressed)
+            ?? (row.checked ? NSColor.controlAccentColor.withAlphaComponent(0.14) : nil)
+        guard let wash else { return }
+        wash.setFill()
+        NSBezierPath(
+            roundedRect: rect.insetBy(dx: PanelRowMetrics.inset - 8, dy: 1),
+            xRadius: PanelRowMetrics.rowCorner,
+            yRadius: PanelRowMetrics.rowCorner
+        ).fill()
+    }
+
+    /// The bar lane. Checked rows get the solid accent, unchecked rows a lighter one; the empty tail
+    /// stays a faint track so the lane's full width is visible even for the smallest row.
+    private func drawBar(for row: Row, in rect: NSRect, fraction: Double) {
+        let lane = NSRect(
+            x: barLaneX,
+            y: rect.midY - Layout.barHeight / 2,
+            width: barLaneWidth,
+            height: Layout.barHeight
+        )
+        guard lane.width > 0 else { return }
+        NSColor.controlAccentColor.withAlphaComponent(0.10).setFill()
+        NSBezierPath(
+            roundedRect: lane,
+            xRadius: Layout.barHeight / 2,
+            yRadius: Layout.barHeight / 2
+        ).fill()
+
+        let bar = barRect(in: rect, fraction: fraction)
+        guard bar.width > 0 else { return }
+        NSColor.controlAccentColor
+            .withAlphaComponent(row.checked ? 0.95 : 0.55)
+            .setFill()
+        NSBezierPath(
+            roundedRect: bar,
+            xRadius: Layout.barHeight / 2,
+            yRadius: Layout.barHeight / 2
+        ).fill()
     }
 
     /// Header: `‹ 返回` on the left (the only navigation), aggregate size and count on the right.
@@ -772,66 +840,27 @@ final class PanelProcessesCard: NSView {
     }
 
     private func drawRow(_ row: Row, in rect: NSRect) {
-        // Checkbox
-        let box = checkboxRect(in: rect)
-        let boxPath = NSBezierPath(roundedRect: box, xRadius: 4, yRadius: 4)
-        if row.checked {
-            NSColor.controlAccentColor.setFill()
-            boxPath.fill()
-            let mark = "✓"
-            let markSize = MenuStyle.size(mark, font: MenuStyle.segmentFont)
-            (mark as NSString).draw(
-                at: NSPoint(x: box.midX - markSize.width / 2, y: box.midY - markSize.height / 2),
-                withAttributes: [
-                    .font: MenuStyle.segmentFont,
-                    .foregroundColor: NSColor.white,
-                ]
-            )
-        } else {
-            NSColor.separatorColor.setStroke()
-            boxPath.lineWidth = 1.5
-            boxPath.stroke()
-        }
-
-        let grid = columns(in: rect)
-
         // Size column: right-aligned on one shared x, whether or not the row is checked.
         let valueFont = row.checked ? MenuStyle.valueBoldFont : MenuStyle.valueFont
         let valueSize = MenuStyle.size(row.bytes, font: valueFont)
         (row.bytes as NSString).draw(
             at: NSPoint(
-                x: grid.valueX + grid.valueWidth - valueSize.width,
-                y: rect.midY - valueSize.height / 2 - 1
+                x: valueRight - valueSize.width,
+                y: rect.midY - valueSize.height / 2
             ),
             withAttributes: [.font: valueFont, .foregroundColor: NSColor.labelColor]
         )
 
-        // Helper count: "18 进程" right after the name, quiet but at full contrast.
-        let suffix = row.processCount > 1 ? "\(row.processCount) 进程" : ""
-        let suffixSize = suffix.isEmpty
-            ? .zero
-            : MenuStyle.size(suffix, font: MenuStyle.captionFont)
-        let suffixX = grid.valueX - suffixSize.width - (suffix.isEmpty ? 0 : 10)
-
-        let nameFont = row.checked ? MenuStyle.sectionFont : MenuStyle.rowLabelFont
-        let nameX = grid.nameX
-        let available = max(20, suffixX - nameX - 6)
-        let name = Self.truncated(row.name, font: nameFont, width: available)
+        // The name owns the column. The helper count lives in `renderedText` only: as a second
+        // column it either truncated the name ("Google Chro…") or appeared on some rows and not
+        // others, and both read as a bug rather than as information.
+        let nameFont = nameFont(for: row)
+        let name = Self.truncated(row.name, font: nameFont, width: nameColumn)
         let nameSize = MenuStyle.size(name, font: nameFont)
         (name as NSString).draw(
-            at: NSPoint(x: nameX, y: rect.midY - nameSize.height / 2 - 2),
+            at: NSPoint(x: nameColumnX, y: rect.midY - nameSize.height / 2),
             withAttributes: [.font: nameFont, .foregroundColor: NSColor.labelColor]
         )
-
-        if !suffix.isEmpty {
-            (suffix as NSString).draw(
-                at: NSPoint(x: suffixX, y: rect.midY - suffixSize.height / 2 - 1),
-                withAttributes: [
-                    .font: MenuStyle.captionFont,
-                    .foregroundColor: NSColor.labelColor,
-                ]
-            )
-        }
     }
 
     /// Shortens a name until it fits, so a long app name never runs under the size column.

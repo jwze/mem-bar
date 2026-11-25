@@ -642,6 +642,11 @@ extension StatusItemController {
         processesCard.layoutSubtreeIfNeeded()
         if processesCard.isKillAvailable { selfTestFail("未勾选时不应出现结束按钮") }
         if !processesCard.killButton.isHidden { selfTestFail("未勾选时结束按钮应隐藏") }
+        // Dynamic window: no footer at all until something is checked, so the card is shorter and
+        // the button has no frame to draw into.
+        if processesCard.killButton.frame != .zero {
+            selfTestFail("未勾选时结束按钮仍有布局帧: \(processesCard.killButton.frame)")
+        }
         if drawProbe(processesCard) { print("离屏绘制: 高占用列表 OK") }
         showMain()
         if sheet.section != .main { selfTestFail("没有返回主面板") }
@@ -788,6 +793,13 @@ extension StatusItemController {
             // switch section first, then inject, so the row survives into the rendered list.
             showProcesses()
             candidates.insert(sleeperGroup, at: 0)
+            // Measure with the injected row present but unchecked, so the only difference between
+            // the two heights is the footer block itself.
+            checkedKeys = []
+            refreshProcessesCard()
+            sheet.refreshSize()
+            processesCard.layoutSubtreeIfNeeded()
+            let heightWithoutButton = processesCard.frame.height
             checkedKeys = [sleeperGroup.key]
             refreshProcessesCard()
             sheet.refreshSize()
@@ -800,6 +812,17 @@ extension StatusItemController {
             }
             if processesCard.killButton.frame.height != PanelProcessesCard.Layout.footer {
                 selfTestFail("结束按钮高度异常")
+            }
+            // Dynamic window: the same list must be exactly one footer block taller once the button
+            // exists, and the button must sit inside the card.
+            let expectedGrowth = PanelProcessesCard.Layout.footerGap
+                + PanelProcessesCard.Layout.footer
+            if abs(processesCard.frame.height - heightWithoutButton - expectedGrowth) > 0.5 {
+                selfTestFail(
+                    "勾选后卡片高度没有随按钮变化："
+                        + "\(heightWithoutButton) → \(processesCard.frame.height)，"
+                        + "期望 +\(expectedGrowth)"
+                )
             }
             if processesCard.killButton.frame.maxY > processesCard.bounds.maxY {
                 selfTestFail("结束按钮超出卡片范围")
