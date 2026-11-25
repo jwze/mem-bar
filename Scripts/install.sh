@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=Scripts/timeout.sh
+source "$ROOT/Scripts/timeout.sh"
 SOURCE="$ROOT/build/MemBar.app"
 DESTINATION="/Applications/MemBar.app"
 
@@ -13,7 +15,9 @@ fi
 
 if pgrep -x MemBar >/dev/null 2>&1; then
   echo "==> quitting running MemBar"
-  osascript -e 'quit app "MemBar"' >/dev/null 2>&1 || pkill -x MemBar || true
+  # `osascript` can wait on an app that will not quit; cap it so the install never blocks.
+  run_with_timeout 10 osascript -e 'quit app "MemBar"' >/dev/null 2>&1 \
+    || pkill -x MemBar || true
   sleep 1
 fi
 
