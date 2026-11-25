@@ -35,8 +35,13 @@ public struct CleanOutcome: Equatable, Sendable {
     public var reclaimed: Bool { freeDelta > 0 }
     public var pressureWorsened: Bool { after.pressure.rank > before.pressure.rank }
 
-    /// One line for the menu, e.g.
-    /// `空闲 1.2 GB → 2.6 GB（+480 MB），缓存 4.9 GB → 4.4 GB · 用时 0.7 秒`
+    /// The only thing the panel says about a clean: how much it actually handed back.
+    /// `已释放 297 MB` / `无可释放缓存`. Deliberately one short phrase — the full before/after
+    /// numbers live in `detailText` (log, `--diagnostics`) instead of the popup.
+    public var releaseSummary: String {
+        reclaimed ? "已释放 " + Fmt.bytes(UInt64(freeDelta)) : "无可释放缓存"
+    }
+
     public var detailText: String {
         var parts: [String] = []
         if reclaimed {

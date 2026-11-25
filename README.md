@@ -11,8 +11,9 @@ macOS 菜单栏内存监控 + 一键清理。原生 Swift / AppKit，零第三�
 
 菜单栏项是**自绘固定宽度徽章**（45×18 pt，按 `100%` 定宽）：压力色胶囊 + 白色等宽数字，2× 位图渲染保证 Retina 清晰，图片按 `(百分比, 等级)` 缓存，只在取整百分比或压力等级变化时重绘。
 
-- **看内存**：菜单栏实时百分比；点开是「大号百分比 + 内存构成条 + 右对齐数值列」的明细卡片。
-- **一键清理**：`⌘K` 释放自身内存 → 内存气球子进程 →（可选）结束勾选的应用，并如实回显结果。
+- **看内存**：菜单栏实时百分比；点开是一张**统一面板卡片**：大号压力色百分比 + 压力胶囊 + 内存构成条 + 右对齐数值列。
+- **一键清理**：面板里唯一的**醒目实心按钮**（`⌘K`）：释放自身内存 → 内存气球子进程 →（可选）结束勾选的应用，并如实回显结果。
+- **不灰化**：只读区域（数字、图例、结果行）全部满对比度绘制，不用灰度也不降透明度 —— 禁用的系统菜单项会被 AppKit 自动灰化，所以信息区改由自绘视图承载。
 
 📖 **完整使用教程：[docs/USAGE.md](docs/USAGE.md)**
 
@@ -23,49 +24,54 @@ macOS 菜单栏内存监控 + 一键清理。原生 Swift / AppKit，零第三�
 | 能力 | 说明 |
 | --- | --- |
 | 内存百分比 | 菜单栏胶囊徽章，压力色 + 等宽数字，默认 5 秒刷新（可切 2/5/10 秒） |
-| 明细卡片 | 大号压力色百分比 + 三段构成条（已用/缓存/空闲）+ 数值右对齐成列 |
+| 明细卡片 | 一张自绘卡片：大号压力色百分比 + 压力胶囊 + 三段构成条 + 数值右对齐成列，全部满对比度 |
+| 醒目按钮 | 面板中唯一的实心强调色按钮，白字 + `⌘K` 提示，悬停/按下都有反馈 |
 | 压力分级 | 🟢 正常 / 🟡 偏高 / 🔴 紧张（基于 vm 统计 + swap 的**估算**，见下文口径） |
 | 一键清理 | `⌘K`：释放自身内存 → 子进程「内存气球」→（可选）结束勾选的应用 |
-| 结果回显 | 直接显示 `空闲 A → B（+Δ），缓存 C → D · 用时 N 毫秒`，不谎报效果 |
-| 高占用进程 | 只在菜单打开时扫描，**按应用聚合**（Chrome 的 7 个 helper 只占一行） |
-| 开机自启 | `SMAppService.mainApp` 登录项，首次启动自动注册，菜单里一键开关 |
+| 结果回显 | 只报一句实话：`已释放 297 MB` 或 `无可释放缓存`（完整 before/after 进日志），不谎报效果 |
+| 高占用应用 | 只在弹窗打开时扫描，**按应用聚合**（Chrome 的 7 个 helper 只占一行） |
+| 开机自启 | `SMAppService.mainApp` 登录项，首次启动自动注册，面板里一键开关 |
 | 单实例 | 再次启动不会出现第二个图标 |
 | 极低占用 | 物理 footprint ≈17 MB，默认 5 秒刷新时空闲 CPU ≈0%，不联网、不写统计文件 |
 
 ## 快速开始
 
 ```bash
-./Scripts/build-app.sh      # release 构建 + 打包 .app + 生成图标 + ad-hoc 签名 + 冒烟诊断
+./Scripts/build-app.sh      # release 构建 + 打包 .app + 图标 + ad-hoc 签名 + 冒烟诊断（60 秒硬超时）
 ./Scripts/install.sh        # 复制到 /Applications 并启动
 ```
 
 要求：macOS 14+、Xcode 或 Command Line Tools（提供 `swift`）。
 
-首次启动后菜单栏出现徽章，**没有** Dock 图标，**不会**弹任何授权框，并自动注册登录项（菜单里可随时关闭）。
+`build-app.sh` 每一步都在 60 秒总预算内运行：任何一步超时就判**构建失败**并杀掉整棵进程树（`BUILD_TIMEOUT=120` 可放宽）。
 
-## 菜单
+首次启动后菜单栏出现徽章，**没有** Dock 图标，**不会**弹任何授权框，并自动注册登录项（面板里可随时关闭）。
+
+## 面板（点菜单栏徽章）
 
 ```
-70%   11.08 GB / 16 GB              ← 大号压力色百分比 + 已用/总量
-███████████████░░░░░░░░░            ← 构成条：黑=已用 蓝=缓存 青=空闲
-● 已用 11.08 GB  ● 缓存 4.45 GB  ● 空闲 245 MB
-──────────────────────────
-已用 · 🟡 偏高        11.08 GB       ← 数值右对齐成一列
-缓存                   4.45 GB
-压缩                   3.56 GB
-交换 · 已用 71.8%   2.87 GB / 4 GB
-──────────────────────────
-⚡ 一键清理                  ⌘K
-上次清理：空闲 490 MB → 862 MB · 用时 1.7 秒 · 12 秒前
-高占用进程 ▸
-──────────────────────────
-刷新间隔 ▸   2 秒 / 5 秒✓ / 10 秒
-☑ 登录时自动启动
-──────────────────────────
-退出 MemBar                  ⌘Q
+ 67%   已用 10.62 GB / 16 GB        ╭──────╮
+ ████████████████░░░░░░░░░░         │ 偏高 │  ← 压力胶囊，与菜单栏徽章同色
+ ● 已用    ● 缓存    ● 空闲          ╰──────╯
+ ──────────────────────────────────────
+ 缓存                              4.55 GB
+ 空闲                             376.7 MB
+ 压缩                              2.92 GB
+ 交换 · 已用 65.4%           1.96 GB / 3 GB
+ ┌────────────────────────────────────┐
+ │           ⚡ 一键清理    ⌘K         │   ← 唯一的醒目实心按钮
+ └────────────────────────────────────┘
+ 上次清理   已释放 292 MB            12 秒前
+ ──────────────────────────────────────
+ 高占用应用                          ›
+ ──────────────────────────────────────
+ 刷新间隔                  2 秒  5 秒✓  10 秒
+ 登录时自动启动 ✓
+ ──────────────────────────────────────
+ 退出 MemBar                        ⌘Q
 ```
 
-### 高占用进程：按应用聚合
+### 高占用应用：按应用聚合（面板第二页）
 
 ```
 WeChat  ·16                          723.8 MB
@@ -73,7 +79,8 @@ node  ·7                             635.1 MB
 IntelliJ IDEA  ·2                    426.8 MB
 Google Chrome  ·7                    413.7 MB
 ──────────────────────────
-结束选中应用 (0)
+点按应用即可勾选，可多选结束   ← 没勾选时是一行提示（满亮度），勾选后变成
+结束选中应用 (2)                「结束选中应用 (N)」按钮
 ```
 
 同一个 `.app` 的全部进程（渲染器 / GPU / Helper）合并成一行、尺寸相加，避免一个浏览器把 Top 8 全占满；
@@ -110,7 +117,8 @@ Google Chrome  ·7                    413.7 MB
 MemBar/
 ├─ Package.swift                     # SwiftPM：MemBarCore(库) + MemBar(可执行)
 ├─ Scripts/
-│  ├─ build-app.sh                   # 构建 → 组装 .app → 图标 → 签名 → 冒烟诊断
+│  ├─ build-app.sh                   # 构建 → 组装 .app → 图标 → 签名 → 冒烟诊断（60 s 上限）
+│  ├─ timeout.sh                     # 构建步骤的硬超时（macOS 没有 coreutils timeout）
 │  ├─ install.sh                     # 安装到 /Applications 并启动
 │  ├─ GenerateAppIcon.swift          # 生成 Resources/AppIcon.icns（构建时按需调用）
 │  └─ Info.plist                     # App Bundle 元数据（LSUIElement=true）
@@ -125,7 +133,8 @@ MemBar/
    │  └─ Support/{AppInfo,Log,Prefs,Fmt}.swift
    └─ MemBar/                        # AppKit 外壳
       ├─ main.swift                  # 参数分流（balloon / clean / diagnostics / selftest）
-      └─ App/{AppDelegate,StatusItemController,MenuStyle,MenuBarBadge,
+      └─ App/{AppDelegate,StatusItemController,PanelSheetView,
+              PanelCardView,PanelRowCards,MenuStyle,MenuBarBadge,
               Sampler,LoginItem,SingleInstance}.swift
 ```
 
@@ -136,7 +145,9 @@ swift build -c release                                   # 只编译
 ./Scripts/build-app.sh                                   # 产出 build/MemBar.app
 ./build/MemBar.app/Contents/MacOS/MemBar --diagnostics    # 打印一次采样后退出
 ./build/MemBar.app/Contents/MacOS/MemBar --clean 128      # 跑一次清理流水线（不结束进程）
-./build/MemBar.app/Contents/MacOS/MemBar --selftest       # UI + 清理流水线端到端自检
+./build/MemBar.app/Contents/MacOS/MemBar --selftest       # UI + 清理流水线端到端自检（55 s 上限，必定退出）
+./build/MemBar.app/Contents/MacOS/MemBar --preview /tmp/x  # 把三张卡片渲染成 PNG，便于比对 UI
+BUILD_TIMEOUT=120 ./Scripts/build-app.sh                  # 放宽构建超时（默认 60 s）
 ```
 
 ## 卸载

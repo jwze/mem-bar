@@ -2,17 +2,43 @@ import AppKit
 import Darwin
 import MemBarCore
 
+/// Owns the menu-bar badge and the popup.
+///
+/// The popup is an `NSPopover` hosting the cards directly, not an `NSMenu`. A menu lays itself out
+/// once and cannot be re-flowed while it is tracking, so the old implementation had to cancel
+/// tracking and re-open the popup for every page switch and every height change — that is what
+/// flickered, and cancelling a menu from inside its own click handler is what crashed it.
+///
+/// With a popover: switching sections is a `hidden` flip, the one-click action keeps the popup open
+/// while it reports progress and its result, and a rescan just repaints.
 @MainActor
-final class StatusItemController: NSObject, NSMenuDelegate {
+final class StatusItemController: NSObject, NSPopoverDelegate {
     private let statusItem: NSStatusItem
-    private let menu = NSMenu()
+    private let popover = NSPopover()
 
     private var sampler: Sampler?
     private var snapshot: MemorySnapshot?
 
+    private let panelCard = PanelCardView()
+    private let actionsCard = PanelActionsCard()
+    private let processesCard = PanelProcessesCard()
+    private let sheet: PanelSheetView
+    private let sheetController: PanelSheetViewController
+
+    private var keyMonitor: Any?
+
     private var lastClean: CleanOutcome?
     private var lastCleanAt: Date?
-    private var lastKill: (text: String, at: Date)?
+    private var lastKill: KillEvent?
+    private var lastLoginIssue: (text: String, at: Date)?
+
+    /// A short, self-contained description of the last "结束选中应用", so the panel can show it in
+    /// one phrase instead of a report.
+    private struct KillEvent {
+        var value: String
+        var tone: PanelCardView.ResultLine.Tone
+        var at: Date
+    }
 
     /// Last rendered menu-bar state; the system only redraws the bar when these change, so a
     /// 5 s tick that lands on the same percent/pressure must not touch the title again.
@@ -24,36 +50,24 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     /// Checked rows, keyed by `AppGroup.key` (bundle path or executable name) — not by pid,
     /// because one row covers several processes.
     private var checkedKeys: Set<String> = []
-    /// Tab stop shared by every process row so their sizes form one right-aligned column.
-    private var processColumnWidth: CGFloat = 0
 
     private let placeholderImage = MenuBarBadge.image(text: "–%", pressure: .normal)
-
-    private let headlineItem = NSMenuItem()
-    private let gaugeItem = NSMenuItem()
-    private let legendItem = NSMenuItem()
-    private let usedItem = NSMenuItem()
-    private let cacheItem = NSMenuItem()
-    private let compressedItem = NSMenuItem()
-    private let swapItem = NSMenuItem()
-    private let cleanItem = NSMenuItem()
-    private let resultItem = NSMenuItem()
-    private let processesItem = NSMenuItem()
-    private let processesMenu = NSMenu()
-    private let killSelectedItem = NSMenuItem()
-    private let intervalItem = NSMenuItem()
-    private let intervalMenu = NSMenu()
-    private let loginItemToggle = NSMenuItem()
-    private let quitItem = NSMenuItem()
 
     override init() {
         // Fixed width: a variable-length item forces the window server to re-lay-out the whole
         // menu bar on every percentage change, which dominates the app's CPU time. The badge is
         // sized for the widest label ("100%") and every state reuses that width.
         self.statusItem = NSStatusBar.system.statusItem(withLength: MenuBarBadge.fixedWidth)
+        self.sheet = PanelSheetView(
+            panelCard: panelCard,
+            actionsCard: actionsCard,
+            processesCard: processesCard
+        )
+        self.sheetController = PanelSheetViewController(sheet: sheet)
         super.init()
         configureButton()
-        configureMenu()
+        configurePopover()
+        wireCards()
     }
 
     /// Whether the item is actually in the menu bar (a third-party menu-bar manager can hide it).
@@ -77,12 +91,43 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         button.imagePosition = .imageOnly
         button.imageScaling = .scaleNone
         button.toolTip = "MemBar 内存监控"
-        statusItem.menu = menu
+        // No `statusItem.menu`: one click opens the popover, one click closes it again.
+        button.target = self
+        button.action = #selector(togglePopover)
+        button.sendAction(on: [.leftMouseUp])
+    }
+
+    private func configurePopover() {
+        popover.contentViewController = sheetController
+        popover.behavior = .transient
+        popover.animates = false
+        popover.delegate = self
+        popover.contentSize = sheet.preferredSize
+        sheet.onPreferredSizeChange = { [weak self] size in
+            guard let self else { return }
+            // The popover only resizes itself while it is on screen; the size is also the next
+            // opening size, so it must be stored either way.
+            self.popover.contentSize = size
+        }
+    }
+
+    private func wireCards() {
+        panelCard.onClean = { [weak self] in self?.cleanNow() }
+        actionsCard.onOpenProcesses = { [weak self] in self?.showProcesses() }
+        actionsCard.onSelectInterval = { [weak self] seconds in self?.applyInterval(seconds) }
+        actionsCard.onToggleLogin = { [weak self] in self?.toggleLoginItem() }
+        actionsCard.onQuit = { [weak self] in self?.quit() }
+        processesCard.onBack = { [weak self] in self?.showMain() }
+        processesCard.onToggle = { [weak self] key in self?.toggleProcess(key) }
+        processesCard.onKill = { [weak self] in self?.killSelected() }
     }
 
     private func apply(_ snapshot: MemorySnapshot) {
         self.snapshot = snapshot
         updateStatusButton(snapshot)
+        refreshPanel()
+        // The summary card can change height only with the swap row; keep the popover honest.
+        if popover.isShown { sheet.refreshSize() }
     }
 
     private func updateStatusButton(_ snapshot: MemorySnapshot) {
@@ -106,252 +151,234 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         }
     }
 
-    // MARK: - Menu construction
+    // MARK: - Popover
 
-    private func configureMenu() {
-        menu.delegate = self
-        menu.autoenablesItems = false
-
-        for item in [headlineItem, gaugeItem, legendItem, usedItem, cacheItem,
-                     compressedItem, swapItem, resultItem] {
-            item.isEnabled = false
-            // A brand-new NSMenuItem carries no title and NSMenu paints the class name in its
-            // place; every row must have one, even the image-only gauge.
-            item.title = ""
-        }
-        menu.addItem(headlineItem)
-        menu.addItem(gaugeItem)
-        menu.addItem(legendItem)
-        menu.addItem(.separator())
-        menu.addItem(usedItem)
-        menu.addItem(cacheItem)
-        menu.addItem(compressedItem)
-        menu.addItem(swapItem)
-        menu.addItem(.separator())
-
-        cleanItem.title = "⚡ 一键清理"
-        cleanItem.target = self
-        cleanItem.action = #selector(cleanNow)
-        cleanItem.keyEquivalent = "k"
-        cleanItem.keyEquivalentModifierMask = [.command]
-        menu.addItem(cleanItem)
-        menu.addItem(resultItem)
-
-        processesItem.title = "高占用进程"
-        processesItem.submenu = processesMenu
-        processesMenu.autoenablesItems = false
-        killSelectedItem.title = "结束选中进程 (0)"
-        killSelectedItem.target = self
-        killSelectedItem.action = #selector(killSelected)
-        menu.addItem(processesItem)
-        menu.addItem(.separator())
-
-        intervalItem.title = "刷新间隔"
-        intervalItem.submenu = intervalMenu
-        intervalMenu.autoenablesItems = false
-        for seconds in Prefs.refreshOptions {
-            let item = NSMenuItem(
-                title: "\(seconds) 秒",
-                action: #selector(selectInterval(_:)),
-                keyEquivalent: ""
-            )
-            item.target = self
-            item.tag = seconds
-            intervalMenu.addItem(item)
-        }
-        menu.addItem(intervalItem)
-
-        loginItemToggle.title = "登录时自动启动"
-        loginItemToggle.target = self
-        loginItemToggle.action = #selector(toggleLoginItem)
-        menu.addItem(loginItemToggle)
-        menu.addItem(.separator())
-
-        quitItem.title = "退出 MemBar"
-        quitItem.target = self
-        quitItem.action = #selector(quit)
-        quitItem.keyEquivalent = "q"
-        quitItem.keyEquivalentModifierMask = [.command]
-        menu.addItem(quitItem)
-    }
-
-    private func updateInfoItems(_ snapshot: MemorySnapshot) {
-        let pressure = snapshot.pressure
-
-        headlineItem.attributedTitle = MenuStyle.headline(
-            percent: Fmt.percent(snapshot.percent),
-            used: Fmt.bytes(snapshot.used),
-            total: Fmt.bytes(snapshot.total),
-            pressure: pressure
-        )
-
-        gaugeItem.image = MenuStyle.compositionBarImage(
-            used: snapshot.used,
-            cache: snapshot.cache,
-            free: snapshot.free,
-            total: snapshot.total
-        )
-        legendItem.attributedTitle = MenuStyle.compositionLegend(
-            used: snapshot.used,
-            cache: snapshot.cache,
-            free: snapshot.free,
-            total: snapshot.total
-        )
-
-        let usedLabel = "已用 · \(pressure.dot) \(pressure.label)"
-        let swapLabel = "交换 · 已用 \(Fmt.ratioPercent(snapshot.swapRatio))"
-        let column = MenuStyle.columnWidth(for: [
-            (usedLabel, Fmt.bytes(snapshot.used)),
-            ("缓存", Fmt.bytes(snapshot.cache)),
-            ("压缩", Fmt.bytes(snapshot.compressed)),
-            (swapLabel, Fmt.bytes(snapshot.swapUsed) + " / " + Fmt.bytes(snapshot.swapTotal)),
-        ])
-
-        usedItem.attributedTitle = MenuStyle.row(
-            usedLabel,
-            value: Fmt.bytes(snapshot.used),
-            valueColor: MenuStyle.color(for: pressure),
-            columnWidth: column
-        )
-        cacheItem.attributedTitle = MenuStyle.row(
-            "缓存", value: Fmt.bytes(snapshot.cache), columnWidth: column
-        )
-        compressedItem.attributedTitle = MenuStyle.row(
-            "压缩", value: Fmt.bytes(snapshot.compressed), columnWidth: column
-        )
-
-        let swapColor: NSColor = snapshot.swapRatio > 0.8 ? .systemRed : .labelColor
-        swapItem.attributedTitle = MenuStyle.row(
-            swapLabel,
-            value: "\(Fmt.bytes(snapshot.swapUsed)) / \(Fmt.bytes(snapshot.swapTotal))",
-            valueColor: swapColor,
-            columnWidth: column
-        )
-
-        resultItem.attributedTitle = MenuStyle.caption(resultText())
-    }
-
-    private func resultText() -> String {
-        if isCleaning { return "正在清理…" }
-
-        let cleanEvent: (text: String, at: Date)?
-        if let lastClean, let lastCleanAt {
-            cleanEvent = ("上次清理：" + lastClean.detailText, lastCleanAt)
+    @objc private func togglePopover() {
+        if popover.isShown {
+            closePopover()
         } else {
-            cleanEvent = nil
+            showPopover()
         }
-
-        if let kill = lastKill, let clean = cleanEvent {
-            return kill.at > clean.at
-                ? "\(kill.text) · \(Fmt.secondsAgo(kill.at))"
-                : "\(clean.text) · \(Fmt.secondsAgo(clean.at))"
-        }
-        if let clean = cleanEvent {
-            return "\(clean.text) · \(Fmt.secondsAgo(clean.at))"
-        }
-        if let kill = lastKill {
-            return "\(kill.text) · \(Fmt.secondsAgo(kill.at))"
-        }
-        return "上次清理：尚未清理"
     }
 
-    private func updateSubmenuChecks() {
-        for item in intervalMenu.items {
-            item.state = item.tag == Prefs.refreshSeconds ? .on : .off
-        }
+    private func showPopover() {
+        guard let button = statusItem.button else { return }
+        // A fresh scan per opening: the list is only valid for the moment the user looks at it.
+        rescan()
+        setSection(.main)
+        refreshEverything()
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
+        installKeyMonitor()
+    }
 
-        let status = LoginItem.status
-        loginItemToggle.state = status == .enabled ? .on : .off
-        switch status {
-        case .requiresApproval:
-            loginItemToggle.title = "登录时自动启动（需在系统设置允许）"
-        case .notFound:
-            loginItemToggle.title = "登录时自动启动（请先安装到 /Applications）"
+    private func closePopover() {
+        removeKeyMonitor()
+        popover.performClose(nil)
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        removeKeyMonitor()
+        // Leaving the section open would show a stale list on the next opening; the main page is
+        // also where the last verdict line lives.
+        setSection(.main)
+    }
+
+    // MARK: - Sections
+
+    private func setSection(_ section: PanelSheetView.Section) {
+        sheet.setSection(section)
+        popover.contentSize = sheet.preferredSize
+    }
+
+    private func showProcesses() {
+        rescan()
+        checkedKeys.removeAll()
+        refreshProcessesCard()
+        setSection(.processes)
+        sheet.refreshSize()
+    }
+
+    private func showMain() {
+        setSection(.main)
+        refreshActionsCard()
+        sheet.refreshSize()
+    }
+
+    // MARK: - Key handling
+
+    /// Popover instead of menu means there is no `performKeyEquivalent` pass left for ⌘K / ⌘Q;
+    /// a local monitor covers them while the popup is open.
+    private func installKeyMonitor() {
+        removeKeyMonitor()
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handleKey(event) ? nil : event
+        }
+    }
+
+    private func removeKeyMonitor() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
+    }
+
+    func handleKey(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        switch event.keyCode {
+        case 53:  // esc
+            closePopover()
+            return true
+        case 40 where flags.contains(.command):  // ⌘K
+            cleanNow()
+            return true
+        case 12 where flags.contains(.command):  // ⌘Q
+            quit()
+            return true
         default:
-            loginItemToggle.title = "登录时自动启动"
+            return false
         }
     }
 
-    // MARK: - Process submenu
+    // MARK: - Card state
 
-    private func rebuildProcessMenu() {
-        candidates = ProcessScanner.top(limit: 8)
-        checkedKeys = checkedKeys.intersection(Set(candidates.map { $0.key }))
-        renderProcessItems()
+    /// Pushes the current snapshot + state into the summary card. Cheap enough to call on every
+    /// sampling tick.
+    private func refreshPanel() {
+        guard let snapshot else { return }
+        panelCard.update(
+            PanelCardView.Model(
+                snapshot: snapshot,
+                result: resultLine(),
+                isCleaning: isCleaning
+            )
+        )
     }
 
-    /// Renders the submenu from the current `candidates` (no rescan), used by the menu and the self test.
-    ///
-    /// One row per app: every helper of a browser is folded into a single entry, and checking that
-    /// entry means "quit this app", not "kill one random renderer".
-    private func renderProcessItems() {
-        processesMenu.removeAllItems()
+    private func refreshEverything() {
+        refreshPanel()
+        refreshActionsCard()
+        refreshProcessesCard()
+        sheet.refreshSize()
+    }
 
-        if candidates.isEmpty {
-            let empty = NSMenuItem(title: "暂无可结束的进程", action: nil, keyEquivalent: "")
-            empty.isEnabled = false
-            processesMenu.addItem(empty)
-        } else {
-            let column = MenuStyle.columnWidth(
-                for: candidates.map {
-                    (rowLabel(name: $0.displayName, processCount: $0.processCount),
-                     Fmt.bytes($0.totalResident))
-                }
+    private func refreshActionsCard() {
+        let login: PanelActionsCard.LoginState
+        switch LoginItem.status {
+        case .enabled: login = .on
+        case .requiresApproval: login = .requiresApproval
+        case .notFound: login = .notFound
+        default: login = .off
+        }
+        actionsCard.update(
+            PanelActionsCard.Model(
+                processCount: candidates.count,
+                intervalSeconds: Prefs.refreshSeconds,
+                login: login
             )
-            processColumnWidth = column
-            for group in candidates {
-                let item = NSMenuItem(
-                    title: MenuStyle.processRow(
-                        name: group.displayName,
-                        bytes: Fmt.bytes(group.totalResident),
-                        processCount: group.processCount
-                    ),
-                    action: #selector(toggleProcess(_:)),
-                    keyEquivalent: ""
-                )
-                item.target = self
-                item.tag = 0
-                item.representedObject = group.key
-                item.toolTip = group.processCount > 1
-                    ? "\(group.processCount) 个进程 · pids \(group.pids.map(String.init).joined(separator: ", "))"
-                    : "pid \(group.pids.first.map(String.init) ?? "?")"
-                item.state = checkedKeys.contains(group.key) ? .on : .off
-                item.attributedTitle = MenuStyle.processAttributedTitle(
+        )
+    }
+
+    private func rescan() {
+        candidates = ProcessScanner.top(limit: 8)
+        checkedKeys = checkedKeys.intersection(Set(candidates.map(\.key)))
+    }
+
+    private func refreshProcessesCard() {
+        let total = candidates.reduce(UInt64(0)) { $0 + $1.totalResident }
+        var rows: [PanelProcessesCard.Row] = []
+        rows.reserveCapacity(candidates.count)
+        for group in candidates {
+            rows.append(
+                PanelProcessesCard.Row(
+                    key: group.key,
                     name: group.displayName,
                     bytes: Fmt.bytes(group.totalResident),
+                    size: group.totalResident,
                     processCount: group.processCount,
-                    checked: item.state == .on,
-                    columnWidth: column
+                    checked: checkedKeys.contains(group.key)
                 )
-                processesMenu.addItem(item)
-            }
+            )
+        }
+        processesCard.update(
+            rows: rows,
+            subtitle: candidates.isEmpty
+                ? "暂无可结束的进程"
+                : "\(candidates.count) 个应用 · 共 \(Fmt.bytes(total))",
+            isBusy: isCleaning,
+            selection: checkedKeys
+        )
+    }
+
+    /// The one line under the button: `上次清理  已释放 297 MB      31 秒前`.
+    ///
+    /// Only the newest event is shown, and only its human-sized number — the full before/after
+    /// report stays in the log (`CleanOutcome.detailText`) instead of the popup.
+    private func resultLine() -> PanelCardView.ResultLine {
+        if isCleaning {
+            return PanelCardView.ResultLine(
+                prefix: "上次清理",
+                value: "正在清理…",
+                tail: "",
+                tone: .busy
+            )
         }
 
-        processesMenu.addItem(.separator())
-        updateKillItem()
-        processesMenu.addItem(killSelectedItem)
-    }
+        var events: [(line: PanelCardView.ResultLine, at: Date)] = []
 
-    /// The left-hand text of a process row, i.e. everything before the tab that starts the column.
-    private func rowLabel(name: String, processCount: Int) -> String {
-        let suffix = processCount > 1 ? "  ·\(processCount)" : ""
-        return name + suffix
-    }
-
-    private func updateKillItem() {
-        let selected = candidates.filter { checkedKeys.contains($0.key) }
-        killSelectedItem.title = "结束选中应用 (\(selected.count))"
-        killSelectedItem.isEnabled = !selected.isEmpty && !isCleaning
-    }
-
-    /// The GUI app for a group, if any: used so quitting shows the app's own save sheet.
-    private func runningApplication(for group: AppGroup) -> NSRunningApplication? {
-        for pid in group.pids {
-            if let app = NSRunningApplication(processIdentifier: pid) {
-                return app
-            }
+        if let lastClean, let lastCleanAt {
+            events.append((
+                PanelCardView.ResultLine(
+                    prefix: "上次清理",
+                    value: lastClean.releaseSummary,
+                    tail: Fmt.secondsAgo(lastCleanAt),
+                    tone: lastClean.reclaimed ? .good : .idle
+                ),
+                lastCleanAt
+            ))
         }
-        return nil
+
+        if let lastKill {
+            events.append((
+                PanelCardView.ResultLine(
+                    prefix: "已结束",
+                    value: lastKill.value,
+                    tail: Fmt.secondsAgo(lastKill.at),
+                    tone: lastKill.tone
+                ),
+                lastKill.at
+            ))
+        }
+
+        if let lastLoginIssue {
+            events.append((
+                PanelCardView.ResultLine(
+                    prefix: "登录项",
+                    value: lastLoginIssue.text,
+                    tail: Fmt.secondsAgo(lastLoginIssue.at),
+                    tone: .warn
+                ),
+                lastLoginIssue.at
+            ))
+        }
+
+        guard let latest = events.max(by: { $0.at < $1.at }) else {
+            return .placeholder
+        }
+        return latest.line
+    }
+
+    // MARK: - Processes
+
+    private func toggleProcess(_ key: String) {
+        if checkedKeys.contains(key) {
+            checkedKeys.remove(key)
+        } else {
+            checkedKeys.insert(key)
+        }
+        refreshProcessesCard()
+        sheet.refreshSize()
     }
 
     /// Every process of every checked app. Helpers are terminated one by one after the main
@@ -364,6 +391,10 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             }
     }
 
+    private func checkedDisplayNames() -> [String] {
+        candidates.filter { checkedKeys.contains($0.key) }.map { $0.displayName }
+    }
+
     /// Graceful quit for real apps (their save sheet can appear), `SIGTERM` for plain processes.
     nonisolated static func gracefulTerminate(_ pid: pid_t) -> Bool {
         if let app = NSRunningApplication(processIdentifier: pid) {
@@ -372,26 +403,16 @@ final class StatusItemController: NSObject, NSMenuDelegate {
         return kill(pid, SIGTERM) == 0
     }
 
-    // MARK: - NSMenuDelegate
-
-    func menuWillOpen(_ menu: NSMenu) {
-        guard menu === self.menu else { return }
-        rebuildProcessMenu()
-        updateSubmenuChecks()
-        if let snapshot {
-            updateInfoItems(snapshot)
-        }
-    }
-
     // MARK: - Actions
 
-    @objc private func cleanNow() {
+    /// The one-click action keeps the popup open: the button shows "正在清理…" and the result line
+    /// underneath is replaced in place when the pipeline finishes.
+    private func cleanNow() {
         guard !isCleaning else { return }
         isCleaning = true
-        cleanItem.title = "正在清理…"
-        cleanItem.isEnabled = false
-        killSelectedItem.isEnabled = false
-        resultItem.title = resultText()
+        refreshPanel()
+        refreshProcessesCard()
+        sheet.refreshSize()
 
         let victims = victimsForChecked()
         let balloonMB = Prefs.balloonMB
@@ -407,88 +428,88 @@ final class StatusItemController: NSObject, NSMenuDelegate {
             guard let self else { return }
             DispatchQueue.main.async {
                 self.isCleaning = false
-                self.cleanItem.title = "⚡ 一键清理"
-                self.cleanItem.isEnabled = true
                 self.lastClean = outcome
                 self.lastCleanAt = Date()
                 self.checkedKeys.removeAll()
-                self.rebuildProcessMenu()
+                self.rescan()
+                self.refreshActionsCard()
+                self.refreshProcessesCard()
                 self.apply(MemoryStats.sample())
-                if let snapshot = self.snapshot { self.updateInfoItems(snapshot) }
+                self.sheet.refreshSize()
             }
         }
     }
 
-    @objc private func killSelected() {
+    private func killSelected() {
         let victims = victimsForChecked()
         guard !victims.isEmpty else { return }
-        let names = victims.map { $0.name }.joined(separator: "、")
+        let labels = checkedDisplayNames()
 
-        killSelectedItem.isEnabled = false
-        killSelectedItem.title = "正在结束…"
-
+        // Stay in the popup: the verdict line on the main page replaces whatever it showed before,
+        // so the user sees the outcome without re-opening anything.
+        setSection(.main)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             let result = Reclaimer.terminate(victims, graceful: StatusItemController.gracefulTerminate)
             guard let self else { return }
             DispatchQueue.main.async {
                 self.checkedKeys.removeAll()
                 if result.stuck.isEmpty {
-                    self.lastKill = ("上次结束：\(names) · 已结束", Date())
+                    self.lastKill = KillEvent(
+                        value: Self.summary(for: labels, fallbackCount: victims.count, succeeded: true),
+                        tone: .good,
+                        at: Date()
+                    )
                 } else {
-                    self.lastKill = (
-                        "未能结束：\(result.stuck.joined(separator: "、"))",
-                        Date()
+                    self.lastKill = KillEvent(
+                        value: Self.summary(for: result.stuck, fallbackCount: result.stuck.count, succeeded: false),
+                        tone: .warn,
+                        at: Date()
                     )
                 }
                 Log.info("terminate selected ended=\(result.terminated) stuck=\(result.stuck)")
-                self.rebuildProcessMenu()
+                self.rescan()
+                self.refreshActionsCard()
+                self.refreshProcessesCard()
                 self.apply(MemoryStats.sample())
-                if let snapshot = self.snapshot { self.updateInfoItems(snapshot) }
+                self.sheet.refreshSize()
             }
         }
     }
 
-    @objc private func toggleProcess(_ sender: NSMenuItem) {
-        guard let key = sender.representedObject as? String else { return }
-        let checked: Bool
-        if checkedKeys.contains(key) {
-            checkedKeys.remove(key)
-            checked = false
-        } else {
-            checkedKeys.insert(key)
-            checked = true
-        }
-        sender.state = checked ? .on : .off
-        if let group = candidates.first(where: { $0.key == key }) {
-            sender.attributedTitle = MenuStyle.processAttributedTitle(
-                name: group.displayName,
-                bytes: Fmt.bytes(group.totalResident),
-                processCount: group.processCount,
-                checked: checked,
-                columnWidth: processColumnWidth
-            )
-        }
-        updateKillItem()
+    /// One short phrase for the verdict line: a single name, otherwise the number of apps.
+    private static func summary(
+        for names: [String],
+        fallbackCount: Int,
+        succeeded: Bool
+    ) -> String {
+        let verb = succeeded ? "已结束" : "未能结束"
+        guard let first = names.first else { return "\(verb) \(fallbackCount) 个" }
+        let short = first.count > 10 ? String(first.prefix(10)) + "…" : first
+        return names.count > 1 ? "\(verb) \(names.count) 个应用" : "\(verb) \(short)"
     }
 
-    @objc private func selectInterval(_ sender: NSMenuItem) {
-        Prefs.refreshSeconds = sender.tag
+    private func applyInterval(_ seconds: Int) {
+        Prefs.refreshSeconds = seconds
         sampler?.setInterval(Prefs.refreshInterval)
-        updateSubmenuChecks()
+        refreshActionsCard()
+        sheet.refreshSize()
     }
 
-    @objc private func toggleLoginItem() {
+    private func toggleLoginItem() {
         let enable = !LoginItem.isEnabled
         LoginItem.apply(enabled: enable)
         if enable, LoginItem.status != .enabled {
-            lastKill = ("登录项未生效：\(LoginItem.statusDescription)", Date())
+            lastLoginIssue = ("未能开启：\(LoginItem.statusDescription)", Date())
+        } else {
+            lastLoginIssue = nil
         }
-        updateSubmenuChecks()
-        resultItem.attributedTitle = MenuStyle.caption(resultText())
+        refreshActionsCard()
+        refreshPanel()
         Log.info("login item toggle enable=\(enable) status=\(LoginItem.statusDescription)")
+        sheet.refreshSize()
     }
 
-    @objc private func quit() {
+    private func quit() {
         NSApp.terminate(nil)
     }
 
@@ -504,16 +525,25 @@ final class StatusItemController: NSObject, NSMenuDelegate {
     private var selfTestBefore: MemorySnapshot?
     private var selfTestChild: pid_t = 0
     private var selfTestDeadline = Date()
+    /// Absolute cap for the whole self test. A stage that never produces its result must fail the
+    /// run instead of leaving `--selftest` spinning forever (and the terminal waiting on it).
+    private var selfTestHardDeadline = Date()
     private var selfTestOriginalInterval = Prefs.defaultRefreshSeconds
 }
+
 // MARK: - Self test (`MemBar --selftest`)
 
 extension StatusItemController {
-    /// Drives the very same actions the menu items call and prints a PASS/FAIL report.
+    /// Upper bound for the whole self test, comfortably below the 60 s build budget. A staged test
+    /// must always terminate; hanging is worse than failing.
+    static let selfTestLimit: TimeInterval = 55
+
+    /// Drives the very same actions the popup calls and prints a PASS/FAIL report.
     /// A timer walks the stages because the production actions finish on the main queue.
     func runSelfTest() {
         var failures: [String] = []
         selfTestOriginalInterval = Prefs.refreshSeconds
+        selfTestHardDeadline = Date().addingTimeInterval(Self.selfTestLimit)
         apply(MemoryStats.sample())
         print("\(AppInfo.name) \(AppInfo.version) 自检")
         print("菜单栏徽章: \(statusItem.button?.image?.size.debugDescription ?? "无")"
@@ -522,30 +552,101 @@ extension StatusItemController {
         print("菜单栏项可见: \(statusItem.isVisible) · 按钮帧: \(statusItem.button?.window?.frame.debugDescription ?? "无")")
         if !statusItem.isVisible { selfTestFail("状态栏项不可见") }
         if statusItem.button?.image == nil { failures.append("菜单栏图标缺失") }
+        if statusItem.menu != nil { selfTestFail("状态栏项仍然挂着菜单，点击会被菜单吃掉") }
 
-        menuWillOpen(menu)
-        print("菜单结构:")
-        for item in menu.items {
-            let label = (item.attributedTitle?.length ?? 0) > 0 ? item.attributedTitle!.string : item.title
-            print("  - \(item.isSeparatorItem ? "──" : label) enabled=\(item.isEnabled) state=\(item.state.rawValue)")
+        // The popup is a popover with a real view hierarchy: no menu items to inspect, and no
+        // cancelTracking / re-open dance to get wrong.
+        refreshEverything()
+        print("弹窗结构: \(Int(sheet.frame.width))×\(Int(sheet.frame.height))"
+            + " · 面板 \(Int(panelCard.frame.height))pt"
+            + " · 动作 \(Int(actionsCard.frame.height))pt"
+            + " · 高占用 \(Int(processesCard.frame.height))pt")
+        if sheet.panelCard !== panelCard { selfTestFail("面板卡片没有挂到 sheet 上") }
+        if popover.contentViewController?.view !== sheet {
+            selfTestFail("sheet 不是 popover 的内容视图")
         }
-        let headlineText = headlineItem.attributedTitle?.string ?? ""
-        let swapText = swapItem.attributedTitle?.string ?? ""
-        let resultTextValue = resultItem.attributedTitle?.string ?? ""
-        if !headlineText.contains("%") || !headlineText.contains("/") {
-            failures.append("摘要行文案异常: \(headlineText)")
+        if popover.contentSize.width != sheet.preferredSize.width {
+            selfTestFail("popover 宽度没有跟随 sheet：\(popover.contentSize) vs \(sheet.preferredSize)")
         }
-        if !swapText.contains("交换") { failures.append("交换行文案异常: \(swapText)") }
-        if !resultTextValue.contains("上次清理") {
-            failures.append("结果行文案异常: \(resultTextValue)")
+        print("面板内容:")
+        for line in panelCard.renderedText.split(separator: "\n") { print("  | \(line)") }
+        print("动作卡片内容:")
+        for line in actionsCard.renderedText.split(separator: "\n") { print("  | \(line)") }
+
+        sheet.layoutSubtreeIfNeeded()
+        panelCard.layoutSubtreeIfNeeded()
+        actionsCard.layoutSubtreeIfNeeded()
+        if drawProbe(sheet) { print("离屏绘制: 整张 sheet OK") }
+        if drawProbe(panelCard) { print("离屏绘制: 内存面板 OK") }
+        if drawProbe(actionsCard) { print("离屏绘制: 动作卡片 OK") }
+
+        if panelCard.model == nil { selfTestFail("面板卡片没有模型") }
+        if panelCard.frame.width != PanelCardView.Layout.width { selfTestFail("面板宽度异常") }
+        if panelCard.frame.height < 200 { selfTestFail("面板高度异常: \(panelCard.frame.height)") }
+        if panelCard.cleanButton.frame.height != PanelCardView.Layout.button {
+            selfTestFail("一键清理按钮高度异常")
         }
-        if gaugeItem.image == nil { failures.append("构成条图片缺失") }
-        if (legendItem.attributedTitle?.string ?? "").isEmpty { failures.append("图例为空") }
-        if cleanItem.action == nil { failures.append("一键清理没有绑定 action") }
-        if cleanItem.keyEquivalent != "k" { failures.append("一键清理缺少 ⌘K") }
-        if processesItem.submenu == nil { failures.append("高占用进程没有子菜单") }
-        if intervalItem.submenu?.items.count != Prefs.refreshOptions.count { failures.append("刷新间隔选项数量异常") }
-        if killSelectedItem.isEnabled { failures.append("未勾选时「结束选中进程」应为禁用") }
+        let rendered = panelCard.renderedText
+        if !rendered.contains("%") || !rendered.contains("/") {
+            failures.append("摘要行文案异常: \(rendered)")
+        }
+        if !rendered.contains("交换") { failures.append("交换行缺失") }
+        if !rendered.contains("上次清理") { failures.append("结果行文案异常") }
+        // The verdict line must be one short phrase, not the old before/after report.
+        if rendered.contains("→") || rendered.contains("用时") {
+            selfTestFail("结果行仍然是啰嗦的前后对比")
+        }
+        if panelCard.cleanButton.title != "⚡ 一键清理" {
+            selfTestFail("一键清理按钮标题异常: \(panelCard.cleanButton.title)")
+        }
+        if !actionsCard.renderedText.contains("高占用应用") {
+            selfTestFail("动作卡片缺少高占用应用行")
+        }
+        for seconds in Prefs.refreshOptions where !actionsCard.renderedText.contains("\(seconds) 秒") {
+            selfTestFail("刷新间隔缺少 \(seconds) 秒档")
+        }
+        if actionsCard.model?.intervalSeconds != Prefs.refreshSeconds {
+            selfTestFail("动作卡片没有反映当前刷新间隔")
+        }
+        if actionsCard.model?.processCount != candidates.count {
+            selfTestFail("动作卡片的进程数异常")
+        }
+
+        // ⌘K must still reach the clean action without a menu in the middle.
+        if !handleKey(keyEvent(40, flags: .command)) {
+            selfTestFail("⌘K 没有被处理")
+        }
+        // Esc closes the popup; with the popover closed that is a no-op, so only the routing matters.
+        if !handleKey(keyEvent(53, flags: [])) {
+            selfTestFail("esc 没有被处理")
+        }
+
+        // Section switching: the process list replaces the action rows, and back restores them.
+        showProcesses()
+        print("高占用应用内容:")
+        for line in processesCard.renderedText.split(separator: "\n") { print("  | \(line)") }
+        if sheet.section != .processes { selfTestFail("没有切换到高占用应用") }
+        if actionsCard.isHidden == false { selfTestFail("高占用应用下动作卡片仍然可见") }
+        if processesCard.isHidden { selfTestFail("高占用应用下进程列表不可见") }
+        if processesCard.frame.width != PanelCardView.Layout.width {
+            selfTestFail("高占用列表宽度异常: \(processesCard.frame.width)")
+        }
+        if processesCard.rows.isEmpty { selfTestFail("高占用列表为空") }
+        // Ranked list, one column grid: sizes are non-increasing and every row sits inside the card.
+        let sizes = processesCard.rows.map(\.size)
+        if sizes != sizes.sorted(by: >) { selfTestFail("高占用列表没有按占用从大到小排序") }
+        for row in processesCard.rows {
+            if row.size == 0 { selfTestFail("\(row.name) 的占用为 0") }
+        }
+        sheet.layoutSubtreeIfNeeded()
+        processesCard.layoutSubtreeIfNeeded()
+        if processesCard.isKillAvailable { selfTestFail("未勾选时不应出现结束按钮") }
+        if !processesCard.killButton.isHidden { selfTestFail("未勾选时结束按钮应隐藏") }
+        if drawProbe(processesCard) { print("离屏绘制: 高占用列表 OK") }
+        showMain()
+        if sheet.section != .main { selfTestFail("没有返回主面板") }
+        if !processesCard.isHidden { selfTestFail("返回后高占用列表仍然可见") }
+        if actionsCard.isHidden { selfTestFail("返回后动作卡片没有恢复") }
 
         // Pressure rendering: a synthetic "almost nothing reclaimable" snapshot must repaint the
         // badge with the critical colour, and going back must restore the calm colour.
@@ -583,21 +684,14 @@ extension StatusItemController {
             selfTestFail("恢复正常后徽章仍为紧张配色")
         }
 
-        // Refresh-interval menu wiring.
-        if let twoSeconds = intervalMenu.items.first(where: { $0.tag == 2 }) {
-            selectInterval(twoSeconds)
-            if sampler?.interval != 2 { selfTestFail("刷新间隔未生效") }
-            if intervalMenu.items.first(where: { $0.tag == 2 })?.state != .on {
-                selfTestFail("刷新间隔勾选未更新")
-            }
+        // Refresh-interval switching.
+        applyInterval(2)
+        if sampler?.interval != 2 { selfTestFail("刷新间隔未生效") }
+        if actionsCard.model?.intervalSeconds != 2 {
+            selfTestFail("动作卡片未跟随刷新间隔")
         }
-        if let defaultInterval = intervalMenu.items.first(where: { $0.tag == selfTestOriginalInterval }) {
-            selectInterval(defaultInterval)
-        }
+        applyInterval(selfTestOriginalInterval)
         print("偏好切换: 刷新→2s 再回到 \(selfTestOriginalInterval)s")
-        if let quitMenu = menu.items.first(where: { $0 === quitItem }), quitMenu.keyEquivalent != "q" {
-            selfTestFail("退出缺少 ⌘Q")
-        }
 
         // Badge rendering: one cached image per (text, pressure) pair, identical objects for the
         // same pair, and a distinct image per level so the colour really changes.
@@ -638,20 +732,36 @@ extension StatusItemController {
     }
 
     private func selfTestTick() {
+        if Date() > selfTestHardDeadline {
+            selfTestFail("自检整体超时（\(Int(Self.selfTestLimit))s）")
+            if selfTestChild != 0, kill(selfTestChild, 0) == 0 { kill(selfTestChild, SIGKILL) }
+            finishSelfTest()
+            return
+        }
         switch selfTestState {
         case .cleaning:
             if isCleaning {
-                if Date() > selfTestDeadline { selfTestFail("一键清理超时（20s）") }
+                if Date() > selfTestDeadline {
+                    selfTestFail("一键清理超时（20s）")
+                    finishSelfTest()
+                }
                 return
             }
             if let outcome = lastClean {
                 print("一键清理: \(outcome.detailText)")
+                print("  结果行文案: \(outcome.releaseSummary)")
                 print("  之前 free=\(Fmt.bytes(outcome.before.free)) compressed=\(Fmt.bytes(outcome.before.compressed))")
                 print("  之后 free=\(Fmt.bytes(outcome.after.free)) compressed=\(Fmt.bytes(outcome.after.compressed))")
-                print("菜单栏徽章（清理后）: \(statusItem.button?.image?.size.debugDescription ?? "无")")
+                print("面板结果行（清理后）:")
+                for line in panelCard.renderedText.split(separator: "\n").suffix(1) {
+                    print("  | \(line)")
+                }
                 if !outcome.balloonRan { selfTestFail("气球子进程未执行") }
-                if !(resultItem.attributedTitle?.string ?? "").contains("上次清理") {
-                    selfTestFail("结果行没有更新")
+                if !panelCard.renderedText.contains(outcome.releaseSummary) {
+                    selfTestFail("结果行没有显示释放量")
+                }
+                if panelCard.cleanButton.title != "⚡ 一键清理" {
+                    selfTestFail("清理后按钮标题未恢复")
                 }
                 if let before = selfTestBefore {
                     let delta = Int64(outcome.after.free) - Int64(before.free)
@@ -667,7 +777,6 @@ extension StatusItemController {
                 return
             }
             selfTestChild = child
-            rebuildProcessMenu()
             let sleeperGroup = AppGroup(
                 key: "selftest-sleeper",
                 displayName: "selftest-sleeper",
@@ -675,29 +784,46 @@ extension StatusItemController {
                 pids: [child],
                 isApplication: false
             )
+            // `showProcesses()` rescans, and a rescan would throw the injected test process away —
+            // switch section first, then inject, so the row survives into the rendered list.
+            showProcesses()
             candidates.insert(sleeperGroup, at: 0)
             checkedKeys = [sleeperGroup.key]
-            renderProcessItems()
-            print("高占用进程子菜单:")
-            for item in processesMenu.items {
-                print("  - \(item.isSeparatorItem ? "──" : item.title) state=\(item.state.rawValue) enabled=\(item.isEnabled)")
+            refreshProcessesCard()
+            sheet.refreshSize()
+            // Not on screen, so nothing layouts the card on its own; do it before measuring.
+            processesCard.layoutSubtreeIfNeeded()
+            print("高占用列表（勾选后）:")
+            for line in processesCard.renderedText.split(separator: "\n") { print("  | \(line)") }
+            if !processesCard.isKillAvailable || processesCard.killButton.isHidden {
+                selfTestFail("勾选后应出现可用的结束按钮")
             }
-            if !killSelectedItem.isEnabled { selfTestFail("勾选后「结束选中进程」应为可用") }
+            if processesCard.killButton.frame.height != PanelProcessesCard.Layout.footer {
+                selfTestFail("结束按钮高度异常")
+            }
+            if processesCard.killButton.frame.maxY > processesCard.bounds.maxY {
+                selfTestFail("结束按钮超出卡片范围")
+            }
             killSelected()
             selfTestState = .killing
             selfTestDeadline = Date().addingTimeInterval(10)
 
         case .killing:
             if lastKill == nil {
-                if Date() > selfTestDeadline { selfTestFail("结束进程超时（10s）") }
+                if Date() > selfTestDeadline {
+                    selfTestFail("结束进程超时（10s）")
+                    if selfTestChild != 0 { kill(selfTestChild, SIGKILL) }
+                    finishSelfTest()
+                }
                 return
             }
-            print("结束进程: \(lastKill?.text ?? "<无结果>")")
+            print("结束进程: \(lastKill?.value ?? "<无结果>")")
             if kill(selfTestChild, 0) == 0 {
                 selfTestFail("测试进程仍在运行")
                 kill(selfTestChild, SIGKILL)
             }
-            if killSelectedItem.isEnabled { selfTestFail("结束后「结束选中进程」应回到禁用") }
+            if processesCard.isKillAvailable { selfTestFail("结束后应回到提示行") }
+            if sheet.section != .main { selfTestFail("结束后应回到主面板") }
             finishSelfTest()
 
         case .idle:
@@ -709,6 +835,12 @@ extension StatusItemController {
         selfTestTimer?.invalidate()
         selfTestTimer = nil
         selfTestState = .idle
+        // The test spawns `/bin/sleep 60`; a FAIL path must still reap it, otherwise an orphan
+        // survives the run.
+        if selfTestChild != 0 {
+            if kill(selfTestChild, 0) == 0 { kill(selfTestChild, SIGKILL) }
+            selfTestChild = 0
+        }
 
         // Login item round trip (only meaningful for the installed copy, which is the one
         // Background Task Management tracks; the pref is restored afterwards).
@@ -722,6 +854,10 @@ extension StatusItemController {
             print("登录项往返: 初始=\(wasEnabled) 关闭后=\(offStatus.rawValue) 恢复=\(LoginItem.isEnabled)")
             if wasEnabled, offStatus == .enabled { selfTestFail("登录项无法关闭") }
             if LoginItem.isEnabled != wasEnabled { selfTestFail("登录项状态未能恢复") }
+            refreshActionsCard()
+            if actionsCard.model?.login.isOn != LoginItem.isEnabled {
+                selfTestFail("动作卡片未反映登录项状态")
+            }
         } else {
             print("登录项往返: 跳过（未安装在 /Applications）")
         }
@@ -743,6 +879,49 @@ extension StatusItemController {
 
     private func selfTestFail(_ message: String) {
         selfTestFailures.append(message)
+    }
+
+    private func keyEvent(_ keyCode: UInt16, flags: NSEvent.ModifierFlags) -> NSEvent {
+        NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: flags,
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            characters: "",
+            charactersIgnoringModifiers: "",
+            isARepeat: false,
+            keyCode: keyCode
+        ) ?? NSEvent()
+    }
+
+    /// Renders one card into an off-screen bitmap (selftest only, never on the user's screen).
+    @discardableResult
+    private func drawProbe(_ view: NSView) -> Bool {
+        let size = view.bounds.size
+        guard size.width >= 1, size.height >= 1,
+              let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: Int(size.width.rounded(.up)),
+                pixelsHigh: Int(size.height.rounded(.up)),
+                bitsPerSample: 8,
+                samplesPerPixel: 4,
+                hasAlpha: true,
+                isPlanar: false,
+                colorSpaceName: .deviceRGB,
+                bytesPerRow: 0,
+                bitsPerPixel: 0
+              ),
+              let context = NSGraphicsContext(bitmapImageRep: rep) else {
+            selfTestFail("无法离屏绘制 \(type(of: view))")
+            return false
+        }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = context
+        view.displayIgnoringOpacity(view.bounds, in: context)
+        NSGraphicsContext.restoreGraphicsState()
+        return true
     }
 
     private func spawnSleeper() -> pid_t? {
