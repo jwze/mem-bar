@@ -43,6 +43,15 @@ macOS 菜单栏内存监控 + 一键清理。原生 Swift / AppKit，零第三�
 
 要求：macOS 14+、Xcode 或 Command Line Tools（提供 `swift`）。
 
+## GitHub Actions 构建与发布
+
+GitHub Actions 会在向 `main` 推送或创建 Pull Request 时构建并运行冒烟诊断；构建产物 `MemBar.zip` 可在对应的 Actions 运行记录中下载。推送版本标签（例如 `v1.0.0`）会在构建通过后自动创建 GitHub Release，并附上该安装包：
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
 `build-app.sh` 每一步都在 60 秒总预算内运行：任何一步超时就判**构建失败**并杀掉整棵进程树（`BUILD_TIMEOUT=120` 可放宽）。
 
 首次启动后菜单栏出现徽章，**没有** Dock 图标，**不会**弹任何授权框，并自动注册登录项（面板里可随时关闭）。
